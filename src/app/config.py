@@ -30,8 +30,10 @@ class ModelScopeSettings:
     api_base: str
     model: str
     timeout_seconds: float
-    max_chars_per_chapter: int
+    chunk_chars: int
     chapter_concurrency: int
+    chunk_concurrency: int
+    max_retries: int
 
     @property
     def is_configured(self) -> bool:
@@ -46,6 +48,24 @@ class ModelScopeSettings:
         return f"{self.api_key[:4]}...{self.api_key[-4:]}"
 
 
+@dataclass(frozen=True)
+class RagSettings:
+    chunk_size: int
+    chunk_overlap: int
+    top_k: int
+    embedding_model: str
+
+
+def get_rag_settings() -> RagSettings:
+    load_local_env()
+    return RagSettings(
+        chunk_size=int(os.getenv("RAG_CHUNK_SIZE", "600")),
+        chunk_overlap=int(os.getenv("RAG_CHUNK_OVERLAP", "120")),
+        top_k=int(os.getenv("RAG_TOP_K", "5")),
+        embedding_model=os.getenv("RAG_EMBEDDING_MODEL", "BAAI/bge-small-zh-v1.5"),
+    )
+
+
 def get_modelscope_settings() -> ModelScopeSettings:
     load_local_env()
     api_key = os.getenv("MODELSCOPE_API_KEY") or os.getenv("MODELSCOPE_ACCESS_TOKEN")
@@ -54,6 +74,8 @@ def get_modelscope_settings() -> ModelScopeSettings:
         api_base=os.getenv("MODELSCOPE_API_BASE", "https://api-inference.modelscope.cn/v1").rstrip("/"),
         model=os.getenv("MODELSCOPE_MODEL", "Qwen/Qwen3-30B-A3B-Instruct-2507"),
         timeout_seconds=float(os.getenv("MODELSCOPE_TIMEOUT_SECONDS", "120")),
-        max_chars_per_chapter=int(os.getenv("KG_MAX_CHARS_PER_CHAPTER", "12000")),
-        chapter_concurrency=max(1, int(os.getenv("KG_CHAPTER_CONCURRENCY", "3"))),
+        chunk_chars=int(os.getenv("KG_CHUNK_CHARS", os.getenv("KG_MAX_CHARS_PER_CHAPTER", "8000"))),
+        chapter_concurrency=max(1, int(os.getenv("KG_CHAPTER_CONCURRENCY", "1"))),
+        chunk_concurrency=max(1, int(os.getenv("KG_CHUNK_CONCURRENCY", "2"))),
+        max_retries=max(0, int(os.getenv("MODELSCOPE_MAX_RETRIES", "2"))),
     )

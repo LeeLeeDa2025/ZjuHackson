@@ -12,6 +12,7 @@ const state = {
   searchQuery: "",
   view: { scale: 1, x: 0, y: 0 },
   pointer: null,
+  suppressGraphClick: false,
   uploadItems: [],
   buildSteps: [],
 };
@@ -84,7 +85,7 @@ dropZone.addEventListener("drop", (event) => uploadFiles(event.dataTransfer.file
 async function boot() {
   resetPreview();
   renderBuildProgress(defaultBuildSteps());
-  await Promise.all([loadModelScopeConfig(), loadTextbooks()]);
+  await Promise.all([loadModelScopeConfig(), loadTextbooks(), loadRagStatus()]);
 }
 
 async function loadModelScopeConfig() {
@@ -332,7 +333,7 @@ async function buildKnowledgeGraphByScope() {
     updateBuildStep("parse", "completed");
     for (const target of targets) {
       updateBuildStep(`extract:${target.textbook_id}`, "active", `正在抽取：${target.title || target.filename}`);
-      builtGraphs.push(await postBuildGraph(target));
+      builtGraphs.push(await postBuildGraph(target, (job) => updateBookProgressStep(target, job)));
       updateBuildStep(`extract:${target.textbook_id}`, "completed", `已完成：${target.title || target.filename}`);
     }
     updateBuildStep("relations", "active");
@@ -368,18 +369,31 @@ function getBuildTargets() {
   return completed.filter((book) => book.textbook_id === graphScopeSelect.value);
 }
 
-async function postBuildGraph(book) {
-  const response = await fetch(`/api/textbooks/${encodeURIComponent(book.textbook_id)}/knowledge-graph`, {
+async function postBuildGraph(book, onProgress) {
+  const startResponse = await fetch(`/api/textbooks/${encodeURIComponent(book.textbook_id)}/knowledge-graph/jobs`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
-      max_chapters: Math.min(book.chapter_count || 1, 20),
+      max_chapters: book.chapter_count || 1,
       force: true,
     }),
   });
-  const data = await response.json();
-  if (!response.ok) throw new Error(data.detail || `构建失败：${book.title || book.filename}`);
-  return data;
+  let job = await startResponse.json();
+  if (!startResponse.ok) throw new Error(job.detail || `构建失败：${book.title || book.filename}`);
+  onProgress?.(job);
+
+  while (job.status === "queued" || job.status === "running") {
+    await sleep(1000);
+    const progressResponse = await fetch(`/api/knowledge-graph/jobs/${encodeURIComponent(job.job_id)}`);
+    job = await progressResponse.json();
+    if (!progressResponse.ok) throw new Error(job.detail || `获取构建进度失败：${book.title || book.filename}`);
+    onProgress?.(job);
+  }
+
+  if (job.status !== "completed") {
+    throw new Error(job.error || job.message || `构建失败：${book.title || book.filename}`);
+  }
+  return job.graph;
 }
 
 function defaultBuildSteps() {
@@ -416,21 +430,58 @@ function renderBuildProgress(steps) {
   buildProgressPercent.className = `status-pill ${failed ? "failed" : percent === 100 ? "" : "muted"}`;
   buildProgressSteps.innerHTML = steps
     .map(
-      (step) => `
+      (step) => {
+        const chapters = step.chapters?.length
+          ? `
+            <div class="chapter-progress-list">
+              ${step.chapters
+                .map(
+                  (chapter) => `
+                    <div class="chapter-progress-row ${chapter.status}">
+                      <span>${escapeHtml(chapter.title)}</span>
+                      <strong>${chapter.chunks_done || 0}/${chapter.chunks_total || 0}</strong>
+                    </div>
+                  `,
+                )
+                .join("")}
+            </div>
+          `
+          : "";
+        return `
         <div class="build-step ${step.status}">
           <i></i>
           <div>
             <strong>${escapeHtml(step.label)}</strong>
             <span>${escapeHtml(step.detail)}</span>
+            ${chapters}
           </div>
         </div>
-      `,
+      `;
+      },
     )
     .join("");
 }
 
 function updateBuildStep(id, status, detail) {
   state.buildSteps = state.buildSteps.map((step) => (step.id === id ? { ...step, status, detail: detail || step.detail } : step));
+  renderBuildProgress(state.buildSteps);
+}
+
+function updateBookProgressStep(book, job) {
+  const done = (job.chapters || []).filter((chapter) => chapter.status === "completed").length;
+  const failed = (job.chapters || []).filter((chapter) => chapter.status === "failed").length;
+  const total = (job.chapters || []).length || book.chapter_count || 0;
+  const detail = `${job.progress || 0}% · 章节 ${done}/${total}${failed ? ` · 失败 ${failed}` : ""} · ${job.message || "抽取中"}`;
+  state.buildSteps = state.buildSteps.map((step) =>
+    step.id === `extract:${book.textbook_id}`
+      ? {
+          ...step,
+          status: job.status === "failed" ? "failed" : job.status === "completed" ? "completed" : "active",
+          detail,
+          chapters: job.chapters || [],
+        }
+      : step,
+  );
   renderBuildProgress(state.buildSteps);
 }
 
@@ -468,10 +519,9 @@ function renderKnowledgeGraph() {
 }
 
 function drawGraph(graph) {
-  const width = 1280;
-  const height = 760;
   const visibleNodes = graph.nodes.slice(0, 320);
   const visibleIds = new Set(visibleNodes.map((node) => node.id));
+  const { width, height } = graphCanvasSize(visibleNodes);
   const query = state.searchQuery;
 
   graphSvg.setAttribute("viewBox", `0 0 ${width} ${height}`);
@@ -495,6 +545,8 @@ function drawGraph(graph) {
         y2: target.y,
         class: `graph-edge ${edge.relation_type}`,
         "stroke-width": Math.min(1 + (edge.frequency || 1) * 0.45, 4),
+        "data-source": edge.source,
+        "data-target": edge.target,
       }),
     );
   });
@@ -527,8 +579,16 @@ function drawGraph(graph) {
     });
     group.addEventListener("pointerdown", (event) => {
       event.stopPropagation();
-      const point = svgPoint(event);
-      state.pointer = { mode: "node", nodeId: node.id, start: point, origin: { ...pos }, moved: false };
+      event.preventDefault();
+      const point = graphPoint(event);
+      state.pointer = {
+        mode: "node",
+        nodeId: node.id,
+        start: point,
+        origin: { ...pos },
+        moved: false,
+        pointerId: event.pointerId,
+      };
       graphSvg.setPointerCapture(event.pointerId);
     });
     viewport.appendChild(group);
@@ -537,49 +597,197 @@ function drawGraph(graph) {
 
 function ensureGraphPositions() {
   if (!state.graph) return;
-  const layoutKey = state.graph.nodes.map((node) => `${node.id}:${node.name}:${node.textbook_ids?.join(",")}`).join("|");
-  if (state.graphLayoutKey !== layoutKey) {
-    state.graphPositions = new Map();
-    state.graphLayoutKey = layoutKey;
-    state.view = { scale: 1, x: 0, y: 0 };
-  }
+  const visibleNodes = state.graph.nodes.slice(0, 320);
+  const visibleIds = new Set(visibleNodes.map((node) => node.id));
+  const visibleEdges = state.graph.edges.filter((edge) => visibleIds.has(edge.source) && visibleIds.has(edge.target));
+  const layoutKey = [
+    visibleNodes.map((node) => `${node.id}:${node.name}:${node.frequency}:${node.textbook_ids?.join(",")}`).join("|"),
+    visibleEdges.map((edge) => `${edge.source}>${edge.target}:${edge.relation_type}:${edge.frequency || 1}`).join("|"),
+  ].join("::");
+  const hasPositions = visibleNodes.every((node) => state.graphPositions.has(node.id));
+  if (state.graphLayoutKey === layoutKey && hasPositions) return;
 
-  const { width, height } = graphCanvasSize(state.graph.nodes);
-  const groups = groupNodesBySource(state.graph.nodes.slice(0, 320));
-  const groupGap = 80;
-  const totalGap = groupGap * Math.max(groups.length - 1, 0);
-  const groupWidth = (width - 160 - totalGap) / Math.max(groups.length, 1);
-
-  groups.forEach((group, groupIndex) => {
-    const cols = Math.max(1, Math.ceil(Math.sqrt(group.nodes.length * 1.35)));
-    const rows = Math.max(1, Math.ceil(group.nodes.length / cols));
-    const spacingX = Math.max(112, Math.min(170, groupWidth / Math.max(cols, 1)));
-    const spacingY = Math.max(92, Math.min(132, (height - 170) / Math.max(rows, 1)));
-    const groupLeft = 80 + groupIndex * (groupWidth + groupGap);
-    const blockWidth = (cols - 1) * spacingX;
-    const blockHeight = (rows - 1) * spacingY;
-    const startX = groupLeft + groupWidth / 2 - blockWidth / 2;
-    const startY = height / 2 - blockHeight / 2;
-
-    group.nodes.forEach((node, index) => {
-      if (state.graphPositions.has(node.id)) return;
-      const col = index % cols;
-      const row = Math.floor(index / cols);
-      const stagger = row % 2 ? spacingX * 0.22 : 0;
-      state.graphPositions.set(node.id, { x: startX + col * spacingX + stagger, y: startY + row * spacingY });
-    });
-  });
+  state.graphLayoutKey = layoutKey;
+  state.graphPositions = computeConnectedPapersLayout(visibleNodes, visibleEdges);
+  state.view = { scale: 1, x: 0, y: 0 };
 }
 
 function graphCanvasSize(nodes) {
-  const groups = groupNodesBySource(nodes.slice(0, 320));
-  const largestGroup = Math.max(...groups.map((group) => group.nodes.length), 1);
-  const cols = Math.max(1, Math.ceil(Math.sqrt(largestGroup * 1.35)));
-  const rows = Math.max(1, Math.ceil(largestGroup / cols));
+  const count = Math.max(nodes.length, 1);
+  const scale = Math.sqrt(count);
   return {
-    width: Math.max(1280, groups.length * Math.max(620, cols * 128) + Math.max(groups.length - 1, 0) * 80),
-    height: Math.max(760, rows * 112 + 180),
+    width: Math.max(1280, Math.round(840 + scale * 92)),
+    height: Math.max(760, Math.round(600 + scale * 64)),
   };
+}
+
+function computeConnectedPapersLayout(nodes, edges) {
+  const { width, height } = graphCanvasSize(nodes);
+  const center = { x: width / 2, y: height / 2 };
+  const groups = groupNodesBySource(nodes);
+  const clusterCenters = sourceClusterCenters(groups, width, height);
+  const nodeState = new Map();
+  const degree = new Map(nodes.map((node) => [node.id, 0]));
+  edges.forEach((edge) => {
+    degree.set(edge.source, (degree.get(edge.source) || 0) + 1);
+    degree.set(edge.target, (degree.get(edge.target) || 0) + 1);
+  });
+
+  groups.forEach((group, groupIndex) => {
+    const groupCenter = clusterCenters.get(group.sourceId) || center;
+    group.nodes.forEach((node, nodeIndex) => {
+      const seed = hashString(`${node.id}:${node.name}`);
+      const angle = seededAngle(seed + nodeIndex * 997);
+      const ring = 42 + Math.sqrt(nodeIndex + 1) * 34;
+      const centrality = Math.min((degree.get(node.id) || 0) + (node.frequency || 1), 18);
+      const centerBias = centrality / 18;
+      nodeState.set(node.id, {
+        node,
+        x: groupCenter.x * (1 - centerBias * 0.28) + center.x * centerBias * 0.28 + Math.cos(angle) * ring,
+        y: groupCenter.y * (1 - centerBias * 0.28) + center.y * centerBias * 0.28 + Math.sin(angle) * ring,
+        vx: 0,
+        vy: 0,
+        radius: nodeRadius(node),
+        cluster: group.sourceId,
+        groupIndex,
+      });
+    });
+  });
+
+  const layoutNodes = Array.from(nodeState.values());
+  const links = edges
+    .map((edge) => ({ ...edge, sourceNode: nodeState.get(edge.source), targetNode: nodeState.get(edge.target) }))
+    .filter((edge) => edge.sourceNode && edge.targetNode);
+
+  for (let iteration = 0; iteration < 260; iteration += 1) {
+    const cooling = 1 - iteration / 260;
+
+    for (let i = 0; i < layoutNodes.length; i += 1) {
+      const a = layoutNodes[i];
+      for (let j = i + 1; j < layoutNodes.length; j += 1) {
+        const b = layoutNodes[j];
+        let dx = b.x - a.x;
+        let dy = b.y - a.y;
+        let distanceSq = dx * dx + dy * dy || 0.01;
+        const distance = Math.sqrt(distanceSq);
+        const minDistance = a.radius + b.radius + 38;
+        const repel = Math.min(4200 / distanceSq, 2.4) * cooling;
+        dx /= distance;
+        dy /= distance;
+        a.vx -= dx * repel;
+        a.vy -= dy * repel;
+        b.vx += dx * repel;
+        b.vy += dy * repel;
+
+        if (distance < minDistance) {
+          const push = (minDistance - distance) * 0.045 * cooling;
+          a.vx -= dx * push;
+          a.vy -= dy * push;
+          b.vx += dx * push;
+          b.vy += dy * push;
+        }
+      }
+    }
+
+    links.forEach((edge) => {
+      const source = edge.sourceNode;
+      const target = edge.targetNode;
+      let dx = target.x - source.x;
+      let dy = target.y - source.y;
+      const distance = Math.sqrt(dx * dx + dy * dy) || 0.01;
+      const desired = relationDistance(edge.relation_type) + source.radius + target.radius - Math.min(edge.frequency || 1, 6) * 5;
+      const strength = relationStrength(edge.relation_type) * Math.min(edge.frequency || 1, 4) * cooling;
+      const pull = ((distance - desired) / distance) * strength;
+      dx *= pull;
+      dy *= pull;
+      source.vx += dx;
+      source.vy += dy;
+      target.vx -= dx;
+      target.vy -= dy;
+    });
+
+    layoutNodes.forEach((item) => {
+      const groupCenter = clusterCenters.get(item.cluster) || center;
+      const centrality = Math.min((degree.get(item.node.id) || 0) + (item.node.frequency || 1), 18) / 18;
+      item.vx += (center.x - item.x) * (0.006 + centrality * 0.008) * cooling;
+      item.vy += (center.y - item.y) * (0.006 + centrality * 0.008) * cooling;
+      item.vx += (groupCenter.x - item.x) * 0.0035 * cooling;
+      item.vy += (groupCenter.y - item.y) * 0.0035 * cooling;
+      item.vx *= 0.72;
+      item.vy *= 0.72;
+      item.x += clamp(item.vx, -18, 18);
+      item.y += clamp(item.vy, -18, 18);
+    });
+  }
+
+  fitLayoutToCanvas(layoutNodes, width, height);
+  return new Map(layoutNodes.map((item) => [item.node.id, { x: item.x, y: item.y }]));
+}
+
+function sourceClusterCenters(groups, width, height) {
+  const centers = new Map();
+  const center = { x: width / 2, y: height / 2 };
+  if (groups.length <= 1) {
+    groups.forEach((group) => centers.set(group.sourceId, center));
+    return centers;
+  }
+
+  const radius = Math.min(width, height) * 0.28;
+  groups.forEach((group, index) => {
+    const angle = -Math.PI / 2 + (index / groups.length) * Math.PI * 2;
+    centers.set(group.sourceId, {
+      x: center.x + Math.cos(angle) * radius,
+      y: center.y + Math.sin(angle) * radius * 0.76,
+    });
+  });
+  return centers;
+}
+
+function fitLayoutToCanvas(layoutNodes, width, height) {
+  if (!layoutNodes.length) return;
+  const padding = 90;
+  const minX = Math.min(...layoutNodes.map((item) => item.x - item.radius));
+  const maxX = Math.max(...layoutNodes.map((item) => item.x + item.radius));
+  const minY = Math.min(...layoutNodes.map((item) => item.y - item.radius));
+  const maxY = Math.max(...layoutNodes.map((item) => item.y + item.radius));
+  const scale = Math.min((width - padding * 2) / Math.max(maxX - minX, 1), (height - padding * 2) / Math.max(maxY - minY, 1), 1.35);
+  const offsetX = width / 2 - ((minX + maxX) / 2) * scale;
+  const offsetY = height / 2 - ((minY + maxY) / 2) * scale;
+  layoutNodes.forEach((item) => {
+    item.x = item.x * scale + offsetX;
+    item.y = item.y * scale + offsetY;
+  });
+}
+
+function relationDistance(type) {
+  return {
+    prerequisite: 150,
+    parallel: 118,
+    contains: 96,
+    applies_to: 138,
+  }[type] || 130;
+}
+
+function relationStrength(type) {
+  return {
+    prerequisite: 0.026,
+    parallel: 0.022,
+    contains: 0.034,
+    applies_to: 0.024,
+  }[type] || 0.022;
+}
+
+function hashString(value) {
+  let hash = 2166136261;
+  for (let index = 0; index < value.length; index += 1) {
+    hash ^= value.charCodeAt(index);
+    hash = Math.imul(hash, 16777619);
+  }
+  return hash >>> 0;
+}
+
+function seededAngle(seed) {
+  return ((seed % 10000) / 10000) * Math.PI * 2;
 }
 
 function groupNodesBySource(nodes) {
@@ -763,6 +971,10 @@ function selectGraphNode(nodeId) {
 }
 
 function onGraphClick(event) {
+  if (state.suppressGraphClick) {
+    state.suppressGraphClick = false;
+    return;
+  }
   const nodeElement = event.target.closest?.(".graph-node");
   if (!nodeElement) return;
   event.stopPropagation();
@@ -772,42 +984,65 @@ function onGraphClick(event) {
 function onGraphWheel(event) {
   event.preventDefault();
   const oldScale = state.view.scale;
-  const nextScale = clamp(oldScale * (event.deltaY > 0 ? 0.9 : 1.1), 0.45, 2.8);
-  const rect = graphSvg.getBoundingClientRect();
-  const x = event.clientX - rect.left;
-  const y = event.clientY - rect.top;
-  state.view.x = x - ((x - state.view.x) / oldScale) * nextScale;
-  state.view.y = y - ((y - state.view.y) / oldScale) * nextScale;
+  const nextScale = clamp(oldScale * Math.exp(-event.deltaY * 0.0014), 0.45, 2.8);
+  const point = svgPoint(event);
+  state.view.x = point.x - ((point.x - state.view.x) / oldScale) * nextScale;
+  state.view.y = point.y - ((point.y - state.view.y) / oldScale) * nextScale;
   state.view.scale = nextScale;
-  renderKnowledgeGraph();
+  applyGraphView();
 }
 
 function onGraphPointerDown(event) {
   if (event.target.closest?.(".graph-node")) return;
-  state.pointer = { mode: "pan", startClient: { x: event.clientX, y: event.clientY }, origin: { x: state.view.x, y: state.view.y } };
+  event.preventDefault();
+  state.pointer = {
+    mode: "pan",
+    start: svgPoint(event),
+    origin: { x: state.view.x, y: state.view.y },
+    pointerId: event.pointerId,
+    moved: false,
+  };
   graphSvg.setPointerCapture(event.pointerId);
 }
 
 function onGraphPointerMove(event) {
   if (!state.pointer) return;
+  event.preventDefault();
   if (state.pointer.mode === "pan") {
-    state.view.x = state.pointer.origin.x + event.clientX - state.pointer.startClient.x;
-    state.view.y = state.pointer.origin.y + event.clientY - state.pointer.startClient.y;
-    renderKnowledgeGraph();
+    const point = svgPoint(event);
+    const dx = point.x - state.pointer.start.x;
+    const dy = point.y - state.pointer.start.y;
+    if (Math.abs(dx) + Math.abs(dy) > 2) state.pointer.moved = true;
+    state.view.x = state.pointer.origin.x + dx;
+    state.view.y = state.pointer.origin.y + dy;
+    applyGraphView();
     return;
   }
   if (state.pointer.mode === "node") {
-    const point = svgPoint(event);
-    const dx = (point.x - state.pointer.start.x) / state.view.scale;
-    const dy = (point.y - state.pointer.start.y) / state.view.scale;
-    if (Math.abs(dx) + Math.abs(dy) > 3) state.pointer.moved = true;
-    state.graphPositions.set(state.pointer.nodeId, { x: state.pointer.origin.x + dx, y: state.pointer.origin.y + dy });
-    renderKnowledgeGraph();
+    const point = graphPoint(event);
+    const dx = point.x - state.pointer.start.x;
+    const dy = point.y - state.pointer.start.y;
+    if (Math.abs(dx) + Math.abs(dy) > 2) state.pointer.moved = true;
+    const nextPosition = { x: state.pointer.origin.x + dx, y: state.pointer.origin.y + dy };
+    state.graphPositions.set(state.pointer.nodeId, nextPosition);
+    moveGraphNode(state.pointer.nodeId, nextPosition);
   }
 }
 
-function endGraphPointer() {
-  if (state.pointer?.mode === "node" && !state.pointer.moved) selectGraphNode(state.pointer.nodeId);
+function endGraphPointer(event) {
+  if (!state.pointer) return;
+  if (event?.pointerId !== undefined && state.pointer.pointerId !== event.pointerId) return;
+  try {
+    if (event?.pointerId !== undefined && graphSvg.hasPointerCapture(event.pointerId)) {
+      graphSvg.releasePointerCapture(event.pointerId);
+    }
+  } catch {
+    // Pointer capture may already be released by the browser.
+  }
+  if (state.pointer.mode === "node" && !state.pointer.moved) {
+    selectGraphNode(state.pointer.nodeId);
+  }
+  if (state.pointer.moved) state.suppressGraphClick = true;
   state.pointer = null;
 }
 
@@ -818,6 +1053,42 @@ function svgPoint(event) {
     x: ((event.clientX - rect.left) / rect.width) * viewBox.width + viewBox.x,
     y: ((event.clientY - rect.top) / rect.height) * viewBox.height + viewBox.y,
   };
+}
+
+function graphPoint(event) {
+  const point = svgPoint(event);
+  return {
+    x: (point.x - state.view.x) / state.view.scale,
+    y: (point.y - state.view.y) / state.view.scale,
+  };
+}
+
+function applyGraphView() {
+  const viewport = graphSvg.querySelector(".graph-viewport");
+  if (viewport) {
+    viewport.setAttribute("transform", `translate(${state.view.x} ${state.view.y}) scale(${state.view.scale})`);
+  }
+}
+
+function moveGraphNode(nodeId, position) {
+  const nodeElement = graphSvg.querySelector(`.graph-node[data-node-id="${cssEscape(nodeId)}"]`);
+  if (nodeElement) {
+    nodeElement.setAttribute("transform", `translate(${position.x} ${position.y})`);
+  }
+
+  graphSvg.querySelectorAll(`.graph-edge[data-source="${cssEscape(nodeId)}"]`).forEach((edge) => {
+    edge.setAttribute("x1", position.x);
+    edge.setAttribute("y1", position.y);
+  });
+  graphSvg.querySelectorAll(`.graph-edge[data-target="${cssEscape(nodeId)}"]`).forEach((edge) => {
+    edge.setAttribute("x2", position.x);
+    edge.setAttribute("y2", position.y);
+  });
+}
+
+function cssEscape(value) {
+  if (window.CSS?.escape) return CSS.escape(value);
+  return String(value).replaceAll('"', '\\"');
 }
 
 function nodeRadius(node) {
@@ -918,6 +1189,100 @@ function svgElement(name, attributes = {}, text = "") {
   Object.entries(attributes).forEach(([key, value]) => element.setAttribute(key, value));
   if (text) element.textContent = text;
   return element;
+}
+
+const chatForm = document.querySelector("#chatForm");
+const chatInput = document.querySelector("#chatInput");
+const chatSubmit = document.querySelector("#chatSubmit");
+const chatMessages = document.querySelector("#chatMessages");
+const ragStatus = document.querySelector("#ragStatus");
+
+chatForm.addEventListener("submit", sendRagQuery);
+chatInput.addEventListener("input", () => {
+  chatSubmit.disabled = !chatInput.value.trim();
+});
+
+async function sendRagQuery(event) {
+  event.preventDefault();
+  const question = chatInput.value.trim();
+  if (!question) return;
+
+  addChatMessage("question", question);
+  chatInput.value = "";
+  chatSubmit.disabled = true;
+  ragStatus.textContent = "思考中...";
+  ragStatus.className = "status-pill parsing";
+
+  try {
+    const body = { question, top_k: 5 };
+    if (graphScopeSelect.value !== "all" && state.activeBook?.textbook_id) {
+      body.textbook_ids = [state.activeBook.textbook_id];
+    }
+    const response = await fetch("/api/rag/query", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    const data = await response.json();
+    if (!response.ok) throw new Error(data.detail || "问答请求失败");
+    addChatMessage("answer", data.answer, data.sources || []);
+    ragStatus.textContent = "就绪";
+    ragStatus.className = "status-pill";
+  } catch (error) {
+    addChatMessage("error", error.message || "问答请求失败");
+    ragStatus.textContent = "出错";
+    ragStatus.className = "status-pill failed";
+  }
+}
+
+function addChatMessage(role, content, sources) {
+  const placeholder = chatMessages.querySelector(".chat-placeholder");
+  if (placeholder) placeholder.remove();
+
+  const msg = document.createElement("div");
+  msg.className = `chat-message ${role}`;
+
+  if (role === "answer") {
+    const body = document.createElement("div");
+    body.className = "answer-body";
+    body.textContent = content;
+    msg.appendChild(body);
+
+    if (sources && sources.length) {
+      const sourceDiv = document.createElement("div");
+      sourceDiv.className = "answer-sources";
+      sourceDiv.innerHTML = "<strong>参考来源：</strong>";
+      sources.forEach((source) => {
+        const badge = document.createElement("span");
+        badge.className = "source-item";
+        badge.textContent = `[${source.source_index}] 《${source.textbook_title}》${source.chapter_title}`;
+        badge.title = source.excerpt;
+        badge.addEventListener("click", () => {
+          selectBook(source.textbook_id);
+        });
+        sourceDiv.appendChild(badge);
+      });
+      msg.appendChild(sourceDiv);
+    }
+  } else {
+    msg.textContent = content;
+  }
+
+  chatMessages.appendChild(msg);
+  chatMessages.scrollTop = chatMessages.scrollHeight;
+}
+
+async function loadRagStatus() {
+  try {
+    const response = await fetch("/api/rag/status");
+    if (!response.ok) return;
+    const status = await response.json();
+    const indexedCount = Object.values(status.indexed_textbooks || {}).filter(Boolean).length;
+    ragStatus.textContent = indexedCount ? `${indexedCount} 本已索引` : "未索引";
+    ragStatus.className = `status-pill ${indexedCount ? "" : "muted"}`;
+  } catch {
+    // Silently ignore
+  }
 }
 
 boot();

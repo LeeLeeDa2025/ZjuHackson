@@ -106,6 +106,26 @@
             <div id="nodeDetail" class="node-detail empty">点击任意节点查看名称、定义、所在章节、原文出处和关联关系。</div>
           </aside>
         </section>
+
+          <section class="rag-panel">
+            <div class="panel-header">
+              <h3>知识问答</h3>
+              <span id="ragStatus" class="status-pill muted">就绪</span>
+            </div>
+            <div id="chatMessages" class="chat-messages">
+              <div class="chat-placeholder">基于已索引的教材内容提问，AI 将从教材原文中检索并生成答案。</div>
+            </div>
+            <form id="chatForm" class="chat-form">
+              <input
+                id="chatInput"
+                class="chat-input"
+                type="text"
+                placeholder="输入问题，例如：静息电位的形成机制是什么？"
+                autocomplete="off"
+              />
+              <button id="chatSubmit" type="submit" class="chat-submit" disabled>发送</button>
+            </form>
+          </section>
       </section>
     </main>
 

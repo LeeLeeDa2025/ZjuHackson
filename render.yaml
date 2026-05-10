@@ -1,0 +1,30 @@
+services:
+  - type: web
+    name: zju-hackson
+    env: docker
+    plan: free
+    autoDeploy: true
+    healthCheckPath: /api/health
+    envVars:
+      - key: MODELSCOPE_API_BASE
+        value: https://api-inference.modelscope.cn/v1
+      - key: MODELSCOPE_MODEL
+        value: Qwen/Qwen3-30B-A3B-Instruct-2507
+      - key: MODELSCOPE_TIMEOUT_SECONDS
+        value: "120"
+      - key: MODELSCOPE_MAX_RETRIES
+        value: "2"
+      - key: KG_CHUNK_CHARS
+        value: "8000"
+      - key: KG_CHAPTER_CONCURRENCY
+        value: "1"
+      - key: KG_CHUNK_CONCURRENCY
+        value: "2"
+      - key: RAG_CHUNK_SIZE
+        value: "600"
+      - key: RAG_CHUNK_OVERLAP
+        value: "120"
+      - key: RAG_TOP_K
+        value: "5"
+      - key: RAG_EMBEDDING_MODEL
+        value: BAAI/bge-small-zh-v1.5

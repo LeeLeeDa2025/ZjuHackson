@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import re
 import shutil
 import time
 import uuid
+from datetime import datetime, timezone
 from pathlib import Path
 
 from fastapi import Body, FastAPI, File, HTTPException, UploadFile
@@ -13,11 +15,22 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
 from .config import get_modelscope_settings
-from .graph_builder import build_knowledge_graph
+from .graph_builder import _split_chapter_content, build_knowledge_graph
 from .modelscope_client import ModelScopeNotConfiguredError
 from .parser import UnsupportedFormatError, parse_textbook
-from .schemas import KnowledgeGraph, KnowledgeGraphBuildRequest, Textbook, TextbookSummary, UploadResult
+from .rag_engine import RagEngine
+from .schemas import (
+    KnowledgeGraph,
+    KnowledgeGraphBuildRequest,
+    RagIndexResult,
+    RagQueryRequest,
+    RagQueryResponse,
+    Textbook,
+    TextbookSummary,
+    UploadResult,
+)
 from .storage import TextbookStorage
+from .vector_store import VectorStore
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -25,8 +38,11 @@ DATA_ROOT = PROJECT_ROOT / "data"
 STATIC_ROOT = PROJECT_ROOT / "src" / "web"
 SUPPORTED_SUFFIXES = {".pdf", ".md", ".markdown", ".txt", ".docx"}
 
-app = FastAPI(title="学科知识整合智能体", version="0.1.0")
+app = FastAPI(title="学科知识整合智能体", version="0.2.0")
 storage = TextbookStorage(DATA_ROOT)
+vector_store = VectorStore(DATA_ROOT / "vector_store")
+rag_engine = RagEngine(vector_store, storage)
+graph_jobs: dict[str, dict] = {}
 
 app.add_middleware(
     CORSMiddleware,
@@ -163,7 +179,67 @@ async def create_knowledge_graph(
         raise HTTPException(status_code=502, detail=f"Knowledge graph generation failed: {exc}") from exc
 
     storage.save_knowledge_graph(graph)
+
+    # Auto-index the textbook for RAG queries
+    try:
+        rag_engine.rebuild_index(textbook_id)
+    except Exception:
+        pass
+
     return graph
+
+
+@app.post("/api/textbooks/{textbook_id}/knowledge-graph/jobs")
+async def start_knowledge_graph_job(
+    textbook_id: str,
+    request: KnowledgeGraphBuildRequest = Body(default_factory=KnowledgeGraphBuildRequest),
+) -> dict:
+    textbook = storage.get_textbook(textbook_id, include_content=True)
+    if textbook is None:
+        raise HTTPException(status_code=404, detail="Textbook not found")
+    if not textbook.chapters:
+        raise HTTPException(status_code=400, detail="Textbook has no parsed chapters")
+
+    settings = get_modelscope_settings()
+    selected_chapters = _select_build_chapters(textbook, request)
+    if not selected_chapters:
+        raise HTTPException(status_code=400, detail="No chapters selected")
+
+    job_id = uuid.uuid4().hex
+    chapters = [
+        {
+            "chapter_id": chapter.chapter_id,
+            "title": chapter.title,
+            "status": "pending",
+            "chunks_done": 0,
+            "chunks_total": len(_split_chapter_content(chapter.content, settings.chunk_chars)),
+            "error": None,
+        }
+        for chapter in selected_chapters
+    ]
+    graph_jobs[job_id] = {
+        "job_id": job_id,
+        "textbook_id": textbook_id,
+        "title": textbook.title,
+        "status": "queued",
+        "progress": 0,
+        "message": "等待开始",
+        "created_at": _now_iso(),
+        "updated_at": _now_iso(),
+        "chapters": chapters,
+        "graph": None,
+        "error": None,
+    }
+    asyncio.create_task(_run_knowledge_graph_job(job_id, textbook, request))
+    return graph_jobs[job_id]
+
+
+@app.get("/api/knowledge-graph/jobs/{job_id}")
+def get_knowledge_graph_job(job_id: str) -> dict:
+    job = graph_jobs.get(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="Knowledge graph job not found")
+    return job
 
 
 @app.delete("/api/textbooks/{textbook_id}")
@@ -171,7 +247,135 @@ def delete_textbook(textbook_id: str) -> dict[str, bool]:
     removed = storage.delete_textbook(textbook_id)
     if not removed:
         raise HTTPException(status_code=404, detail="Textbook not found")
+    vector_store.remove_textbook(textbook_id)
     return {"deleted": True}
+
+
+async def _run_knowledge_graph_job(job_id: str, textbook: Textbook, request: KnowledgeGraphBuildRequest) -> None:
+    job = graph_jobs[job_id]
+    job["status"] = "running"
+    job["message"] = "开始抽取知识点"
+    job["updated_at"] = _now_iso()
+
+    async def progress_callback(event: dict) -> None:
+        _apply_graph_job_progress(job, event)
+
+    try:
+        graph = await build_knowledge_graph(
+            textbook,
+            chapter_ids=request.chapter_ids,
+            max_chapters=request.max_chapters,
+            progress_callback=progress_callback,
+        )
+        storage.save_knowledge_graph(graph)
+        try:
+            rag_engine.rebuild_index(textbook.textbook_id)
+        except Exception:
+            pass
+
+        job["status"] = "completed"
+        job["progress"] = 100
+        job["message"] = f"完成：{len(graph.nodes)} 个知识点，{len(graph.edges)} 条关系"
+        job["graph"] = graph.model_dump()
+        job["updated_at"] = _now_iso()
+    except Exception as exc:  # noqa: BLE001 - job endpoint exposes the build error to the UI.
+        job["status"] = "failed"
+        job["error"] = str(exc).strip() or repr(exc)
+        job["message"] = f"生成失败：{job['error']}"
+        job["updated_at"] = _now_iso()
+        _recalculate_graph_job_progress(job)
+
+
+def _select_build_chapters(textbook: Textbook, request: KnowledgeGraphBuildRequest) -> list:
+    chapters = [chapter for chapter in textbook.chapters if chapter.content.strip()]
+    if request.chapter_ids:
+        wanted = set(request.chapter_ids)
+        return [chapter for chapter in chapters if chapter.chapter_id in wanted]
+    return chapters[: request.max_chapters]
+
+
+def _apply_graph_job_progress(job: dict, event: dict) -> None:
+    chapter = next((item for item in job["chapters"] if item["chapter_id"] == event.get("chapter_id")), None)
+    if chapter is None:
+        return
+
+    if event["event"] == "chapter_started":
+        chapter["status"] = "running"
+        chapter["chunks_total"] = event.get("total_chunks") or chapter["chunks_total"]
+        job["message"] = f"正在抽取：{chapter['title']}"
+    elif event["event"] == "chunk_completed":
+        chapter["status"] = "running"
+        chapter["chunks_total"] = event.get("total_chunks") or chapter["chunks_total"]
+        chapter["chunks_done"] = min(chapter["chunks_total"], chapter["chunks_done"] + 1)
+        job["message"] = f"{chapter['title']}：{chapter['chunks_done']}/{chapter['chunks_total']} 个片段"
+    elif event["event"] == "chapter_completed":
+        chapter["status"] = "completed"
+        chapter["chunks_total"] = event.get("total_chunks") or chapter["chunks_total"]
+        chapter["chunks_done"] = chapter["chunks_total"]
+        job["message"] = f"已完成章节：{chapter['title']}"
+    elif event["event"] == "chapter_failed":
+        chapter["status"] = "failed"
+        chapter["error"] = event.get("error") or "章节抽取失败"
+        job["message"] = f"章节失败：{chapter['title']}"
+
+    job["updated_at"] = _now_iso()
+    _recalculate_graph_job_progress(job)
+
+
+def _recalculate_graph_job_progress(job: dict) -> None:
+    total = sum(max(item["chunks_total"], 1) for item in job["chapters"])
+    done = sum(item["chunks_done"] for item in job["chapters"])
+    failed = sum(max(item["chunks_total"], 1) for item in job["chapters"] if item["status"] == "failed")
+    job["progress"] = round(((done + failed) / total) * 100) if total else 0
+
+
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+# ── RAG endpoints ──
+
+
+@app.post("/api/rag/query", response_model=RagQueryResponse)
+async def rag_query(request: RagQueryRequest) -> RagQueryResponse:
+    try:
+        return await rag_engine.query(request)
+    except ModelScopeNotConfiguredError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"RAG query failed: {exc}") from exc
+
+
+@app.post("/api/rag/index/{textbook_id}", response_model=RagIndexResult)
+def rag_index_textbook(textbook_id: str) -> RagIndexResult:
+    textbook = storage.get_textbook(textbook_id)
+    if textbook is None:
+        raise HTTPException(status_code=404, detail="Textbook not found")
+    count = rag_engine.rebuild_index(textbook_id)
+    return RagIndexResult(indexed={textbook_id: count}, total_chunks=vector_store.chunk_count)
+
+
+@app.post("/api/rag/index-all", response_model=RagIndexResult)
+def rag_index_all() -> RagIndexResult:
+    indexed = rag_engine.index_all()
+    return RagIndexResult(indexed=indexed, total_chunks=vector_store.chunk_count)
+
+
+@app.get("/api/rag/status")
+def rag_status() -> dict:
+    summaries = storage.list_summaries()
+    indexed_textbooks: dict[str, bool] = {}
+    for summary in summaries:
+        if summary.status == "completed":
+            indexed_textbooks[summary.textbook_id] = vector_store.has_textbook(summary.textbook_id)
+    return {
+        "total_chunks": vector_store.chunk_count,
+        "textbook_count": len(summaries),
+        "indexed_textbooks": indexed_textbooks,
+    }
+
+
+# ── Internal helpers ──
 
 
 async def _write_upload_file(file: UploadFile, path: Path) -> tuple[int, str]:

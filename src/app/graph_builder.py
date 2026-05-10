@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import re
 from datetime import datetime, timezone
+from typing import Any, Callable
 
 from .config import get_modelscope_settings
 from .modelscope_client import ModelScopeClient
@@ -11,12 +13,14 @@ from .schemas import Chapter, KnowledgeEdge, KnowledgeGraph, KnowledgeNode, Text
 
 
 RELATION_TYPES = {"prerequisite", "parallel", "contains", "applies_to"}
+ProgressCallback = Callable[[dict[str, Any]], Any]
 
 
 async def build_knowledge_graph(
     textbook: Textbook,
     chapter_ids: list[str] | None = None,
     max_chapters: int = 3,
+    progress_callback: ProgressCallback | None = None,
 ) -> KnowledgeGraph:
     settings = get_modelscope_settings()
     client = ModelScopeClient(settings)
@@ -26,12 +30,39 @@ async def build_knowledge_graph(
     edges: list[KnowledgeEdge] = []
     node_id_by_name: dict[str, str] = {}
     edge_keys: set[tuple[str, str, str]] = set()
+    extraction_errors: list[str] = []
     semaphore = asyncio.Semaphore(settings.chapter_concurrency)
-    chapter_graphs = await asyncio.gather(
-        *[_extract_chapter_graph_limited(semaphore, client, chapter, settings.max_chars_per_chapter) for chapter in selected_chapters]
+    chapter_results = await asyncio.gather(
+        *[
+            _extract_chapter_graph_limited(
+                semaphore,
+                client,
+                chapter,
+                settings.chunk_chars,
+                settings.chunk_concurrency,
+                progress_callback,
+            )
+            for chapter in selected_chapters
+        ],
+        return_exceptions=True,
     )
 
-    for chapter, raw_graph in zip(selected_chapters, chapter_graphs, strict=True):
+    for chapter, result in zip(selected_chapters, chapter_results, strict=True):
+        if isinstance(result, Exception):
+            error = _format_exception(result)
+            extraction_errors.append(f"{chapter.title}: {error}")
+            await _notify_progress(
+                progress_callback,
+                {
+                    "event": "chapter_failed",
+                    "chapter_id": chapter.chapter_id,
+                    "chapter_title": chapter.title,
+                    "error": error,
+                },
+            )
+            continue
+
+        raw_graph = result
         local_to_global: dict[str, str] = {}
 
         for raw_node in raw_graph.get("nodes", []):
@@ -80,6 +111,9 @@ async def build_knowledge_graph(
                 )
             )
 
+    if not nodes and extraction_errors:
+        raise RuntimeError("所有章节抽取失败；" + "；".join(extraction_errors[:3]))
+
     return KnowledgeGraph(
         textbook_id=textbook.textbook_id,
         title=textbook.title,
@@ -88,6 +122,7 @@ async def build_knowledge_graph(
         chapter_count=len(selected_chapters),
         nodes=nodes,
         edges=edges,
+        extraction_errors=extraction_errors,
     )
 
 
@@ -95,14 +130,114 @@ async def _extract_chapter_graph_limited(
     semaphore: asyncio.Semaphore,
     client: ModelScopeClient,
     chapter: Chapter,
-    max_chars: int,
+    chunk_chars: int,
+    chunk_concurrency: int,
+    progress_callback: ProgressCallback | None,
 ) -> dict:
     async with semaphore:
-        return await _extract_chapter_graph(client, chapter, max_chars)
+        return await _extract_chapter_graph(client, chapter, chunk_chars, chunk_concurrency, progress_callback)
 
 
-async def _extract_chapter_graph(client: ModelScopeClient, chapter: Chapter, max_chars: int) -> dict:
-    content = chapter.content[:max_chars]
+async def _extract_chapter_graph(
+    client: ModelScopeClient,
+    chapter: Chapter,
+    chunk_chars: int,
+    chunk_concurrency: int = 1,
+    progress_callback: ProgressCallback | None = None,
+) -> dict:
+    chunks = _split_chapter_content(chapter.content, chunk_chars)
+    if not chunks:
+        return {"nodes": [], "edges": []}
+
+    await _notify_progress(
+        progress_callback,
+        {
+            "event": "chapter_started",
+            "chapter_id": chapter.chapter_id,
+            "chapter_title": chapter.title,
+            "total_chunks": len(chunks),
+        },
+    )
+
+    combined_nodes: list[dict] = []
+    combined_edges: list[dict] = []
+    chunk_semaphore = asyncio.Semaphore(chunk_concurrency)
+    chunk_results = await asyncio.gather(
+        *[
+            _extract_chapter_chunk_graph_limited(
+                chunk_semaphore,
+                client,
+                chapter,
+                chunk,
+                chunk_index,
+                len(chunks),
+                progress_callback,
+            )
+            for chunk_index, chunk in enumerate(chunks, start=1)
+        ],
+    )
+
+    for chunk_index, raw_graph in enumerate(chunk_results, start=1):
+        id_prefix = f"chunk_{chunk_index}_"
+        for raw_node in raw_graph.get("nodes", []):
+            node = dict(raw_node)
+            node_id = str(node.get("id", "")).strip()
+            if node_id:
+                node["id"] = f"{id_prefix}{node_id}"
+            combined_nodes.append(node)
+        for raw_edge in raw_graph.get("edges", []):
+            edge = dict(raw_edge)
+            source = str(edge.get("source", "")).strip()
+            target = str(edge.get("target", "")).strip()
+            if source:
+                edge["source"] = f"{id_prefix}{source}"
+            if target:
+                edge["target"] = f"{id_prefix}{target}"
+            combined_edges.append(edge)
+    await _notify_progress(
+        progress_callback,
+        {
+            "event": "chapter_completed",
+            "chapter_id": chapter.chapter_id,
+            "chapter_title": chapter.title,
+            "total_chunks": len(chunks),
+            "completed_chunks": len(chunks),
+        },
+    )
+    return {"nodes": combined_nodes, "edges": combined_edges}
+
+
+async def _extract_chapter_chunk_graph_limited(
+    semaphore: asyncio.Semaphore,
+    client: ModelScopeClient,
+    chapter: Chapter,
+    content: str,
+    chunk_index: int,
+    chunk_count: int,
+    progress_callback: ProgressCallback | None,
+) -> dict:
+    async with semaphore:
+        raw_graph = await _extract_chapter_chunk_graph(client, chapter, content, chunk_index, chunk_count)
+        await _notify_progress(
+            progress_callback,
+            {
+                "event": "chunk_completed",
+                "chapter_id": chapter.chapter_id,
+                "chapter_title": chapter.title,
+                "chunk_index": chunk_index,
+                "total_chunks": chunk_count,
+            },
+        )
+        return raw_graph
+
+
+async def _extract_chapter_chunk_graph(
+    client: ModelScopeClient,
+    chapter: Chapter,
+    content: str,
+    chunk_index: int,
+    chunk_count: int,
+) -> dict:
     messages = [
         {
             "role": "system",
@@ -114,7 +249,7 @@ async def _extract_chapter_graph(client: ModelScopeClient, chapter: Chapter, max
         {
             "role": "user",
             "content": f"""
-请从下面一个教材章节中抽取知识图谱节点和关系。
+请从下面一个教材章节片段中抽取知识图谱节点和关系。
 
 输出必须是如下 JSON 对象：
 {{
@@ -146,21 +281,42 @@ async def _extract_chapter_graph(client: ModelScopeClient, chapter: Chapter, max
 - applies_to：某知识点是另一个的应用场景
 
 要求：
-- 每章抽取 8 到 20 个高价值知识点。
+- 每个片段抽取 6 到 14 个高价值知识点。
 - 节点 id 从 node_001 顺序编号。
 - 边的 source/target 必须引用本次输出中的节点 id。
 - 定义要简洁，避免整段照抄原文。
 - source_excerpt 只能摘取一句关键原文或短语，用于用户点击节点时定位出处。
 
 章节标题：{chapter.title}
+章节片段：{chunk_index}/{chunk_count}
 页码范围：{chapter.page_start or "未知"} - {chapter.page_end or "未知"}
 
-章节正文：
+片段正文：
 {content}
 """.strip(),
         },
     ]
     return _parse_json_object(await client.chat(messages))
+
+
+def _split_chapter_content(content: str, chunk_chars: int) -> list[str]:
+    clean = content.strip()
+    if not clean:
+        return []
+    if len(clean) <= chunk_chars:
+        return [clean]
+
+    chunks: list[str] = []
+    start = 0
+    while start < len(clean):
+        end = min(start + chunk_chars, len(clean))
+        if end < len(clean):
+            split_at = max(clean.rfind("\n", start, end), clean.rfind("。", start, end), clean.rfind("；", start, end))
+            if split_at > start + chunk_chars * 0.55:
+                end = split_at + 1
+        chunks.append(clean[start:end].strip())
+        start = end
+    return [chunk for chunk in chunks if chunk]
 
 
 def _select_chapters(chapters: list[Chapter], chapter_ids: list[str] | None, max_chapters: int) -> list[Chapter]:
@@ -208,3 +364,16 @@ def _coerce_page(value: object) -> int | None:
     except (TypeError, ValueError):
         return None
     return page if page > 0 else None
+
+
+def _format_exception(exc: Exception) -> str:
+    message = str(exc).strip() or repr(exc)
+    return f"{type(exc).__name__}: {message}"
+
+
+async def _notify_progress(progress_callback: ProgressCallback | None, payload: dict[str, Any]) -> None:
+    if progress_callback is None:
+        return
+    result = progress_callback(payload)
+    if inspect.isawaitable(result):
+        await result

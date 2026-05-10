@@ -70,9 +70,42 @@ class KnowledgeGraph(BaseModel):
     chapter_count: int
     nodes: list[KnowledgeNode] = Field(default_factory=list)
     edges: list[KnowledgeEdge] = Field(default_factory=list)
+    extraction_errors: list[str] = Field(default_factory=list)
 
 
 class KnowledgeGraphBuildRequest(BaseModel):
     chapter_ids: list[str] | None = None
-    max_chapters: int = Field(default=3, ge=1, le=20)
+    max_chapters: int = Field(default=3, ge=1, le=200)
     force: bool = False
+
+
+# ── RAG models ──
+
+
+class RagQueryRequest(BaseModel):
+    question: str
+    textbook_ids: list[str] | None = None
+    top_k: int = Field(default=5, ge=1, le=20)
+
+
+class SourceCitation(BaseModel):
+    source_index: int
+    textbook_id: str
+    textbook_title: str
+    chapter_id: str
+    chapter_title: str
+    page: int | None = None
+    excerpt: str
+    score: float
+
+
+class RagQueryResponse(BaseModel):
+    question: str
+    answer: str
+    sources: list[SourceCitation]
+    model: str
+
+
+class RagIndexResult(BaseModel):
+    indexed: dict[str, int]
+    total_chunks: int
