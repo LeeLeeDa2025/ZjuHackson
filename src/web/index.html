@@ -1,0 +1,114 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>学科知识整合智能体</title>
+    <link rel="stylesheet" href="/static/styles.css" />
+  </head>
+  <body>
+    <main class="app-shell">
+      <section class="sidebar">
+        <div>
+          <p class="eyebrow">Textbooks</p>
+          <h1>教材管理</h1>
+        </div>
+
+        <label class="upload-zone" id="dropZone">
+          <input id="fileInput" type="file" multiple accept=".pdf,.md,.markdown,.txt,.docx" />
+          <span class="upload-icon">+</span>
+          <strong>拖拽或点击上传</strong>
+          <small>支持 PDF、Markdown、TXT、DOCX</small>
+        </label>
+
+        <section id="uploadProgressPanel" class="progress-panel hidden">
+          <div class="panel-header compact">
+            <h3>上传进度</h3>
+            <span id="uploadProgressSummary" class="status-pill muted">待上传</span>
+          </div>
+          <div id="uploadProgressList" class="progress-list"></div>
+        </section>
+
+        <div class="summary-strip">
+          <div>
+            <span id="bookCount">0</span>
+            <small>教材</small>
+          </div>
+          <div>
+            <span id="chapterCount">0</span>
+            <small>章节</small>
+          </div>
+          <div>
+            <span id="charCount">0</span>
+            <small>字数</small>
+          </div>
+        </div>
+
+        <div id="fileList" class="file-list"></div>
+      </section>
+
+      <section class="workspace">
+        <header class="topbar">
+          <div>
+            <p class="eyebrow">Knowledge Graph</p>
+            <h2 id="activeTitle">请选择或上传教材</h2>
+          </div>
+          <div class="topbar-actions">
+            <span id="modelscopeStatus" class="status-pill muted">检查魔搭配置</span>
+            <select id="graphScopeSelect" class="select-input" disabled>
+              <option value="all">全部教材</option>
+            </select>
+            <button id="graphButton" class="secondary-button" disabled>生成知识图谱</button>
+            <button id="exportButton" class="secondary-button" disabled>导出统一 JSON</button>
+          </div>
+        </header>
+
+        <section class="structure-grid">
+          <article class="panel">
+            <div class="panel-header">
+              <h3>章节结构</h3>
+              <span id="parseStatus" class="status-pill muted">待解析</span>
+            </div>
+            <div id="chapterList" class="chapter-list empty">上传教材后会显示解析出的章节。</div>
+          </article>
+        </section>
+
+        <section class="progress-panel graph-build-panel">
+          <div class="panel-header compact">
+            <h3>解析与图谱构建进度</h3>
+            <span id="buildProgressPercent" class="status-pill muted">0%</span>
+          </div>
+          <div id="buildProgressSteps" class="build-steps"></div>
+        </section>
+
+        <section class="graph-grid">
+          <article class="panel graph-panel">
+            <div class="graph-toolbar">
+              <div>
+                <h3>知识图谱交互</h3>
+                <p id="graphStats" class="muted-text graph-stats">选择构建范围后点击生成。</p>
+              </div>
+              <div class="graph-controls">
+                <input id="graphSearch" class="search-input" type="search" placeholder="搜索知识点" />
+                <button id="resetViewButton" class="icon-button" type="button" title="重置视图" aria-label="重置视图">↺</button>
+                <span id="graphStatus" class="status-pill muted">未生成</span>
+              </div>
+            </div>
+            <div id="graphLegend" class="graph-legend"></div>
+            <svg id="graphSvg" class="graph-svg" role="img" aria-label="知识图谱"></svg>
+          </article>
+
+          <aside class="panel graph-detail-panel">
+            <div class="panel-header">
+              <h3>节点详情</h3>
+              <span id="detailFrequency" class="status-pill muted">未选择</span>
+            </div>
+            <div id="nodeDetail" class="node-detail empty">点击任意节点查看名称、定义、所在章节、原文出处和关联关系。</div>
+          </aside>
+        </section>
+      </section>
+    </main>
+
+    <script src="/static/app.js"></script>
+  </body>
+</html>

@@ -1,0 +1,210 @@
+from __future__ import annotations
+
+import asyncio
+import json
+import re
+from datetime import datetime, timezone
+
+from .config import get_modelscope_settings
+from .modelscope_client import ModelScopeClient
+from .schemas import Chapter, KnowledgeEdge, KnowledgeGraph, KnowledgeNode, Textbook
+
+
+RELATION_TYPES = {"prerequisite", "parallel", "contains", "applies_to"}
+
+
+async def build_knowledge_graph(
+    textbook: Textbook,
+    chapter_ids: list[str] | None = None,
+    max_chapters: int = 3,
+) -> KnowledgeGraph:
+    settings = get_modelscope_settings()
+    client = ModelScopeClient(settings)
+    selected_chapters = _select_chapters(textbook.chapters, chapter_ids, max_chapters)
+
+    nodes: list[KnowledgeNode] = []
+    edges: list[KnowledgeEdge] = []
+    node_id_by_name: dict[str, str] = {}
+    edge_keys: set[tuple[str, str, str]] = set()
+    semaphore = asyncio.Semaphore(settings.chapter_concurrency)
+    chapter_graphs = await asyncio.gather(
+        *[_extract_chapter_graph_limited(semaphore, client, chapter, settings.max_chars_per_chapter) for chapter in selected_chapters]
+    )
+
+    for chapter, raw_graph in zip(selected_chapters, chapter_graphs, strict=True):
+        local_to_global: dict[str, str] = {}
+
+        for raw_node in raw_graph.get("nodes", []):
+            name = str(raw_node.get("name", "")).strip()
+            if not name:
+                continue
+
+            name_key = _normalize_key(name)
+            global_id = node_id_by_name.get(name_key)
+            if not global_id:
+                global_id = f"node_{len(nodes) + 1:03d}"
+                node_id_by_name[name_key] = global_id
+                nodes.append(
+                    KnowledgeNode(
+                        id=global_id,
+                        name=name,
+                        definition=str(raw_node.get("definition", "")).strip(),
+                        category=str(raw_node.get("category", "核心概念")).strip() or "核心概念",
+                        chapter=str(raw_node.get("chapter", chapter.title)).strip() or chapter.title,
+                        page=_coerce_page(raw_node.get("page")) or chapter.page_start,
+                        source_excerpt=str(raw_node.get("source_excerpt", "")).strip() or None,
+                    )
+                )
+
+            local_id = str(raw_node.get("id", "")).strip()
+            if local_id:
+                local_to_global[local_id] = global_id
+            local_to_global[name] = global_id
+
+        for raw_edge in raw_graph.get("edges", []):
+            source = _resolve_node_id(raw_edge.get("source"), local_to_global, node_id_by_name)
+            target = _resolve_node_id(raw_edge.get("target"), local_to_global, node_id_by_name)
+            relation_type = str(raw_edge.get("relation_type", "")).strip()
+            if not source or not target or source == target or relation_type not in RELATION_TYPES:
+                continue
+            edge_key = (source, target, relation_type)
+            if edge_key in edge_keys:
+                continue
+            edge_keys.add(edge_key)
+            edges.append(
+                KnowledgeEdge(
+                    source=source,
+                    target=target,
+                    relation_type=relation_type,  # type: ignore[arg-type]
+                    description=str(raw_edge.get("description", "")).strip(),
+                )
+            )
+
+    return KnowledgeGraph(
+        textbook_id=textbook.textbook_id,
+        title=textbook.title,
+        model=settings.model,
+        generated_at=datetime.now(timezone.utc).isoformat(),
+        chapter_count=len(selected_chapters),
+        nodes=nodes,
+        edges=edges,
+    )
+
+
+async def _extract_chapter_graph_limited(
+    semaphore: asyncio.Semaphore,
+    client: ModelScopeClient,
+    chapter: Chapter,
+    max_chars: int,
+) -> dict:
+    async with semaphore:
+        return await _extract_chapter_graph(client, chapter, max_chars)
+
+
+async def _extract_chapter_graph(client: ModelScopeClient, chapter: Chapter, max_chars: int) -> dict:
+    content = chapter.content[:max_chars]
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                "你是医学教材知识图谱抽取助手。只输出合法 JSON，不要输出 Markdown。"
+                "知识点要覆盖概念、定理、方法、现象、结构、功能和临床应用。"
+            ),
+        },
+        {
+            "role": "user",
+            "content": f"""
+请从下面一个教材章节中抽取知识图谱节点和关系。
+
+输出必须是如下 JSON 对象：
+{{
+  "nodes": [
+    {{
+      "id": "node_001",
+      "name": "动作电位",
+      "definition": "细胞受到刺激后，膜电位发生的一次快速而可逆的倒转。",
+      "category": "核心概念",
+      "chapter": "{chapter.title}",
+      "page": {chapter.page_start or "null"},
+      "source_excerpt": "该知识点在原文中对应的一句或短语"
+    }}
+  ],
+  "edges": [
+    {{
+      "source": "node_001",
+      "target": "node_002",
+      "relation_type": "prerequisite",
+      "description": "理解动作电位需要先掌握静息电位的概念"
+    }}
+  ]
+}}
+
+关系类型只能从以下四种选择：
+- prerequisite：学习 B 之前必须先掌握 A
+- parallel：同一层级的平行概念
+- contains：上位概念与下位概念
+- applies_to：某知识点是另一个的应用场景
+
+要求：
+- 每章抽取 8 到 20 个高价值知识点。
+- 节点 id 从 node_001 顺序编号。
+- 边的 source/target 必须引用本次输出中的节点 id。
+- 定义要简洁，避免整段照抄原文。
+- source_excerpt 只能摘取一句关键原文或短语，用于用户点击节点时定位出处。
+
+章节标题：{chapter.title}
+页码范围：{chapter.page_start or "未知"} - {chapter.page_end or "未知"}
+
+章节正文：
+{content}
+""".strip(),
+        },
+    ]
+    return _parse_json_object(await client.chat(messages))
+
+
+def _select_chapters(chapters: list[Chapter], chapter_ids: list[str] | None, max_chapters: int) -> list[Chapter]:
+    if chapter_ids:
+        wanted = set(chapter_ids)
+        selected = [chapter for chapter in chapters if chapter.chapter_id in wanted]
+    else:
+        selected = chapters[:max_chapters]
+    return [chapter for chapter in selected if chapter.content.strip()]
+
+
+def _parse_json_object(text: str) -> dict:
+    stripped = text.strip()
+    if stripped.startswith("```"):
+        stripped = re.sub(r"^```(?:json)?\s*", "", stripped)
+        stripped = re.sub(r"\s*```$", "", stripped)
+    try:
+        data = json.loads(stripped)
+    except json.JSONDecodeError:
+        match = re.search(r"\{.*\}", stripped, flags=re.DOTALL)
+        if not match:
+            raise
+        data = json.loads(match.group(0))
+    if not isinstance(data, dict):
+        raise ValueError("Knowledge graph response must be a JSON object.")
+    return data
+
+
+def _resolve_node_id(value: object, local_to_global: dict[str, str], node_id_by_name: dict[str, str]) -> str | None:
+    key = str(value or "").strip()
+    if not key:
+        return None
+    return local_to_global.get(key) or node_id_by_name.get(_normalize_key(key))
+
+
+def _normalize_key(value: str) -> str:
+    return re.sub(r"\s+", "", value).lower()
+
+
+def _coerce_page(value: object) -> int | None:
+    if value is None:
+        return None
+    try:
+        page = int(value)
+    except (TypeError, ValueError):
+        return None
+    return page if page > 0 else None
