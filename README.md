@@ -64,6 +64,20 @@ RAG_EMBEDDING_MODEL=BAAI/bge-small-zh-v1.5
 
 不配置 `MODELSCOPE_API_KEY` 时，教材上传和解析仍可使用；知识图谱生成与 RAG 生成回答会提示缺少模型配置。
 
+## Docker 一键部署
+
+```bash
+cp .env.example .env
+# 然后在 .env 中填写 MODELSCOPE_API_KEY
+docker-compose up -d
+```
+
+启动后访问：
+
+```text
+http://localhost:8000
+```
+
 ## 在线部署
 
 仓库已提供 `Dockerfile` 和 `render.yaml`，可部署到 Render、Railway、Fly.io 等支持 Docker 或 Python Web Service 的平台。

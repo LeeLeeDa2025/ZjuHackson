@@ -576,6 +576,10 @@ function renderKnowledgeGraph() {
     graphSvg.classList.add("hidden");
     graphMatrix.classList.remove("hidden");
     renderKnowledgeMatrix(state.graph, visibleNodes, filteredEdges);
+  } else if (state.graphView === "heatmap") {
+    graphSvg.classList.add("hidden");
+    graphMatrix.classList.remove("hidden");
+    renderAdjacencyHeatmap(state.graph, visibleNodes, filteredEdges);
   } else {
     graphSvg.classList.remove("hidden");
     graphMatrix.classList.add("hidden");
@@ -790,6 +794,115 @@ function renderKnowledgeMatrix(graph, visibleNodes, filteredEdges) {
       </table>
     </div>
   `;
+}
+
+function renderAdjacencyHeatmap(graph, visibleNodes, filteredEdges) {
+  const topNodes = topHeatmapNodes(visibleNodes, filteredEdges, 30);
+  if (!topNodes.length) {
+    graphMatrix.innerHTML = `
+      <div class="matrix-summary">
+        <strong>邻接热力图</strong>
+        <span>当前筛选条件下没有可展示的节点。</span>
+      </div>
+    `;
+    return;
+  }
+
+  const nodeIndex = new Map(topNodes.map((node, index) => [node.id, index]));
+  const matrix = Array.from({ length: topNodes.length }, () => Array(topNodes.length).fill(0));
+  filteredEdges.forEach((edge) => {
+    const sourceIndex = nodeIndex.get(edge.source);
+    const targetIndex = nodeIndex.get(edge.target);
+    if (sourceIndex === undefined || targetIndex === undefined) return;
+    const weight = edge.frequency || 1;
+    matrix[sourceIndex][targetIndex] += weight;
+    matrix[targetIndex][sourceIndex] += weight;
+  });
+
+  const size = topNodes.length;
+  const cell = 22;
+  const labelWidth = 164;
+  const topLabelHeight = 152;
+  const width = labelWidth + size * cell + 24;
+  const height = topLabelHeight + size * cell + 24;
+  const maxWeight = Math.max(1, ...matrix.flat());
+  const labels = topNodes
+    .map((node, index) => {
+      const label = escapeHtml(shortNodeLabel(node.name, 11));
+      const y = topLabelHeight + index * cell + cell * 0.66;
+      const x = labelWidth + index * cell + cell / 2;
+      return `
+        <text class="heatmap-row-label" x="${labelWidth - 10}" y="${y}" text-anchor="end">${label}</text>
+        <text class="heatmap-column-label" x="${x}" y="${topLabelHeight - 10}" transform="rotate(-58 ${x} ${topLabelHeight - 10})">${label}</text>
+      `;
+    })
+    .join("");
+
+  const cells = matrix
+    .map((row, rowIndex) =>
+      row
+        .map((value, columnIndex) => {
+          const node = topNodes[rowIndex];
+          const target = topNodes[columnIndex];
+          const opacity = value ? 0.16 + (value / maxWeight) * 0.72 : 0.04;
+          return `
+            <rect
+              class="heatmap-cell"
+              x="${labelWidth + columnIndex * cell}"
+              y="${topLabelHeight + rowIndex * cell}"
+              width="${cell - 2}"
+              height="${cell - 2}"
+              fill-opacity="${opacity.toFixed(2)}"
+              data-node-id="${node.id}"
+            >
+              <title>${escapeHtml(node.name)} → ${escapeHtml(target.name)}：${formatNumber(value)} 条关系</title>
+            </rect>
+          `;
+        })
+        .join(""),
+    )
+    .join("");
+
+  graphMatrix.innerHTML = `
+    <div class="matrix-summary">
+      <strong>邻接热力图</strong>
+      <span>Top ${topNodes.length} 高频知识点 × Top ${topNodes.length} 高频知识点，颜色越深表示关系越密集。</span>
+    </div>
+    <div class="heatmap-scroll">
+      <svg class="adjacency-heatmap" viewBox="0 0 ${width} ${height}" role="img" aria-label="Top ${topNodes.length} 知识点邻接矩阵">
+        <rect class="heatmap-bg" width="${width}" height="${height}"></rect>
+        ${labels}
+        ${cells}
+      </svg>
+    </div>
+  `;
+
+  graphMatrix.querySelectorAll(".heatmap-cell").forEach((cellElement) => {
+    cellElement.addEventListener("click", () => {
+      selectGraphNode(cellElement.dataset.nodeId);
+    });
+  });
+}
+
+function topHeatmapNodes(nodes, edges, limit) {
+  const relationDegree = new Map(nodes.map((node) => [node.id, 0]));
+  edges.forEach((edge) => {
+    const weight = edge.frequency || 1;
+    relationDegree.set(edge.source, (relationDegree.get(edge.source) || 0) + weight);
+    relationDegree.set(edge.target, (relationDegree.get(edge.target) || 0) + weight);
+  });
+  return [...nodes]
+    .sort((a, b) => {
+      const bScore = (relationDegree.get(b.id) || 0) + (b.frequency || 1) * 0.8 + (b.textbook_count || 1) * 2;
+      const aScore = (relationDegree.get(a.id) || 0) + (a.frequency || 1) * 0.8 + (a.textbook_count || 1) * 2;
+      return bScore - aScore;
+    })
+    .slice(0, limit);
+}
+
+function shortNodeLabel(value, maxLength) {
+  const text = String(value || "");
+  return text.length > maxLength ? `${text.slice(0, maxLength)}…` : text;
 }
 
 function matrixRows(nodes) {

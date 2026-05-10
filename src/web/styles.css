@@ -898,6 +898,43 @@ h3 {
   font-size: 12px;
 }
 
+.heatmap-scroll {
+  overflow: auto;
+  max-height: 590px;
+  background: #fbfcfc;
+}
+
+.adjacency-heatmap {
+  display: block;
+  min-width: 860px;
+  width: 100%;
+}
+
+.heatmap-bg {
+  fill: #fbfcfc;
+}
+
+.heatmap-row-label,
+.heatmap-column-label {
+  fill: var(--text);
+  font-size: 11px;
+  paint-order: stroke;
+  stroke: #fbfcfc;
+  stroke-width: 3px;
+}
+
+.heatmap-cell {
+  fill: var(--accent);
+  stroke: #dce6e2;
+  stroke-width: 1;
+  cursor: pointer;
+}
+
+.heatmap-cell:hover {
+  stroke: #101816;
+  stroke-width: 2;
+}
+
 .graph-background {
   fill: transparent;
 }
