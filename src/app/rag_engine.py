@@ -21,33 +21,92 @@ RAG_SYSTEM_PROMPT = """你是医学教材知识问答助手。请严格基于下
 5. 如果不同教材对同一问题有不同表述，请并列呈现。"""
 
 
-def _build_context(chunks: list[dict]) -> str:
+def _source_key(chunk: dict) -> tuple:
+    return (
+        chunk.get("textbook_id", ""),
+        chunk.get("chapter_id", ""),
+        chunk.get("page_start") or 0,
+        chunk.get("page_end") or 0,
+    )
+
+
+def _group_chunks_by_source(chunks: list[dict]) -> list[dict]:
+    grouped: dict[tuple, dict] = {}
+    for chunk in chunks:
+        key = _source_key(chunk)
+        source = grouped.setdefault(
+            key,
+            {
+                "textbook_id": chunk.get("textbook_id", ""),
+                "textbook_title": chunk.get("textbook_title", ""),
+                "chapter_id": chunk.get("chapter_id", ""),
+                "chapter_title": chunk.get("chapter_title", ""),
+                "page_start": chunk.get("page_start") or 0,
+                "page_end": chunk.get("page_end") or 0,
+                "chunk_start": chunk.get("chunk_index") or 0,
+                "chunk_end": chunk.get("chunk_index") or 0,
+                "score": 0.0,
+                "chunks": [],
+            },
+        )
+        source["chunks"].append(chunk)
+        source["score"] = max(source["score"], chunk.get("score", 0.0))
+        chunk_index = chunk.get("chunk_index") or 0
+        source["chunk_start"] = min(source["chunk_start"], chunk_index)
+        source["chunk_end"] = max(source["chunk_end"], chunk_index)
+
+    sources = list(grouped.values())
+    sources.sort(key=lambda item: item["score"], reverse=True)
+    return sources
+
+
+def _format_source_label(source: dict, index: int) -> str:
+    label = f"[{index}] 《{source.get('textbook_title', '未知教材')}》"
+    chapter = source.get("chapter_title", "")
+    page_start = source.get("page_start") or None
+    page_end = source.get("page_end") or None
+    if chapter:
+        label += f" {chapter}"
+    if page_start and page_end and page_start != page_end:
+        label += f" 第{page_start}-{page_end}页"
+    elif page_start:
+        label += f" 第{page_start}页"
+    else:
+        chunk_start = source.get("chunk_start")
+        chunk_end = source.get("chunk_end")
+        if chunk_start is not None and chunk_end is not None:
+            label += f" 片段{chunk_start}-{chunk_end}" if chunk_start != chunk_end else f" 片段{chunk_start}"
+    return label
+
+
+def _build_context(sources: list[dict]) -> str:
     parts: list[str] = []
-    for i, chunk in enumerate(chunks):
-        source = f"[{i + 1}] 《{chunk.get('textbook_title', '未知教材')}》"
-        chapter = chunk.get("chapter_title", "")
-        page = chunk.get("page_start", "")
-        if chapter:
-            source += f" {chapter}"
-        if page and page != 0:
-            source += f" 第{page}页"
-        parts.append(f"{source}\n{chunk['content']}")
+    for i, source in enumerate(sources):
+        snippets = "\n".join(
+            f"片段 {chunk.get('chunk_index', '')}: {chunk['content']}"
+            for chunk in source["chunks"]
+        )
+        parts.append(f"{_format_source_label(source, i + 1)}\n{snippets}")
     return "\n\n---\n\n".join(parts)
 
 
-def _build_sources(chunks: list[dict]) -> list[SourceCitation]:
+def _build_sources(sources: list[dict]) -> list[SourceCitation]:
     return [
         SourceCitation(
             source_index=i + 1,
-            textbook_id=chunk.get("textbook_id", ""),
-            textbook_title=chunk.get("textbook_title", ""),
-            chapter_id=chunk.get("chapter_id", ""),
-            chapter_title=chunk.get("chapter_title", ""),
-            page=chunk.get("page_start") or None,
-            excerpt=chunk["content"][:300],
-            score=round(chunk.get("score", 0.0), 4),
+            textbook_id=source.get("textbook_id", ""),
+            textbook_title=source.get("textbook_title", ""),
+            chapter_id=source.get("chapter_id", ""),
+            chapter_title=source.get("chapter_title", ""),
+            page=source.get("page_start") or None,
+            page_end=source.get("page_end") or None,
+            chunk_start=source.get("chunk_start"),
+            chunk_end=source.get("chunk_end"),
+            chunk_count=len(source.get("chunks", [])),
+            excerpt="\n".join(chunk["content"] for chunk in source.get("chunks", []))[:500],
+            score=round(source.get("score", 0.0), 4),
         )
-        for i, chunk in enumerate(chunks)
+        for i, source in enumerate(sources)
     ]
 
 
@@ -71,7 +130,8 @@ class RagEngine:
                 model="",
             )
 
-        context = _build_context(chunks)
+        sources = _group_chunks_by_source(chunks)
+        context = _build_context(sources)
         messages = [
             {"role": "system", "content": RAG_SYSTEM_PROMPT},
             {
@@ -87,7 +147,7 @@ class RagEngine:
         return RagQueryResponse(
             question=request.question,
             answer=answer.strip(),
-            sources=_build_sources(chunks),
+            sources=_build_sources(sources),
             model=settings.model,
         )
 

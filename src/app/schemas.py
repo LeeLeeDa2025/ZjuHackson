@@ -95,6 +95,10 @@ class SourceCitation(BaseModel):
     chapter_id: str
     chapter_title: str
     page: int | None = None
+    page_end: int | None = None
+    chunk_start: int | None = None
+    chunk_end: int | None = None
+    chunk_count: int = 1
     excerpt: str
     score: float
 

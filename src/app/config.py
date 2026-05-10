@@ -6,6 +6,13 @@ from pathlib import Path
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
+PLACEHOLDER_API_KEYS = {
+    "",
+    "your_modelscope_api_key_here",
+    "your_api_key_here",
+    "your_key_here",
+    "sk-xxx",
+}
 
 
 def load_local_env(path: Path | None = None) -> None:
@@ -68,7 +75,7 @@ def get_rag_settings() -> RagSettings:
 
 def get_modelscope_settings() -> ModelScopeSettings:
     load_local_env()
-    api_key = os.getenv("MODELSCOPE_API_KEY") or os.getenv("MODELSCOPE_ACCESS_TOKEN")
+    api_key = _normalize_api_key(os.getenv("MODELSCOPE_API_KEY") or os.getenv("MODELSCOPE_ACCESS_TOKEN"))
     return ModelScopeSettings(
         api_key=api_key,
         api_base=os.getenv("MODELSCOPE_API_BASE", "https://api-inference.modelscope.cn/v1").rstrip("/"),
@@ -79,3 +86,12 @@ def get_modelscope_settings() -> ModelScopeSettings:
         chunk_concurrency=max(1, int(os.getenv("KG_CHUNK_CONCURRENCY", "2"))),
         max_retries=max(0, int(os.getenv("MODELSCOPE_MAX_RETRIES", "2"))),
     )
+
+
+def _normalize_api_key(value: str | None) -> str | None:
+    if value is None:
+        return None
+    api_key = value.strip()
+    if api_key.lower() in PLACEHOLDER_API_KEYS:
+        return None
+    return api_key

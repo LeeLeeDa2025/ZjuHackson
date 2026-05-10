@@ -48,7 +48,7 @@ http://localhost:8000
 请从 `.env.example` 复制一份本地配置文件，并填写模型服务参数：
 
 ```env
-MODELSCOPE_API_KEY=your_modelscope_api_key_here
+MODELSCOPE_API_KEY=
 MODELSCOPE_API_BASE=https://api-inference.modelscope.cn/v1
 MODELSCOPE_MODEL=Qwen/Qwen3-30B-A3B-Instruct-2507
 MODELSCOPE_TIMEOUT_SECONDS=120

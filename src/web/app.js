@@ -1,5 +1,9 @@
 const SOURCE_COLORS = ["#12715d", "#3267a8", "#b76e00", "#7b6ab5", "#b42318", "#4f7f2a", "#a1447a"];
 const RELATION_ORDER = ["prerequisite", "parallel", "contains", "applies_to"];
+const GRAPH_NODE_LIMIT = 280;
+const GRAPH_MIN_SCALE = 0.35;
+const GRAPH_MAX_SCALE = 8;
+const GRAPH_WHEEL_ZOOM_SPEED = 0.0025;
 
 const state = {
   textbooks: [],
@@ -519,7 +523,7 @@ function renderKnowledgeGraph() {
 }
 
 function drawGraph(graph) {
-  const visibleNodes = graph.nodes.slice(0, 320);
+  const visibleNodes = graph.nodes.slice(0, GRAPH_NODE_LIMIT);
   const visibleIds = new Set(visibleNodes.map((node) => node.id));
   const { width, height } = graphCanvasSize(visibleNodes);
   const query = state.searchQuery;
@@ -557,8 +561,9 @@ function drawGraph(graph) {
     const dimmed = query && !matches;
     const selected = state.selectedNodeId === node.id;
     const radius = nodeRadius(node);
+    const labeled = shouldShowNodeLabel(node, selected, matches, query);
     const group = svgElement("g", {
-      class: `graph-node ${selected ? "selected" : ""} ${matches ? "matched" : ""} ${dimmed ? "dimmed" : ""}`,
+      class: `graph-node ${selected ? "selected" : ""} ${matches ? "matched" : ""} ${dimmed ? "dimmed" : ""} ${labeled ? "labeled" : ""}`,
       transform: `translate(${pos.x} ${pos.y})`,
       "data-node-id": node.id,
       tabindex: "0",
@@ -597,7 +602,7 @@ function drawGraph(graph) {
 
 function ensureGraphPositions() {
   if (!state.graph) return;
-  const visibleNodes = state.graph.nodes.slice(0, 320);
+  const visibleNodes = state.graph.nodes.slice(0, GRAPH_NODE_LIMIT);
   const visibleIds = new Set(visibleNodes.map((node) => node.id));
   const visibleEdges = state.graph.edges.filter((edge) => visibleIds.has(edge.source) && visibleIds.has(edge.target));
   const layoutKey = [
@@ -616,8 +621,8 @@ function graphCanvasSize(nodes) {
   const count = Math.max(nodes.length, 1);
   const scale = Math.sqrt(count);
   return {
-    width: Math.max(1280, Math.round(840 + scale * 92)),
-    height: Math.max(760, Math.round(600 + scale * 64)),
+    width: Math.max(1700, Math.round(1050 + scale * 145)),
+    height: Math.max(1120, Math.round(820 + scale * 108)),
   };
 }
 
@@ -638,7 +643,7 @@ function computeConnectedPapersLayout(nodes, edges) {
     group.nodes.forEach((node, nodeIndex) => {
       const seed = hashString(`${node.id}:${node.name}`);
       const angle = seededAngle(seed + nodeIndex * 997);
-      const ring = 42 + Math.sqrt(nodeIndex + 1) * 34;
+      const ring = 100 + Math.sqrt(nodeIndex + 1) * 72;
       const centrality = Math.min((degree.get(node.id) || 0) + (node.frequency || 1), 18);
       const centerBias = centrality / 18;
       nodeState.set(node.id, {
@@ -659,8 +664,8 @@ function computeConnectedPapersLayout(nodes, edges) {
     .map((edge) => ({ ...edge, sourceNode: nodeState.get(edge.source), targetNode: nodeState.get(edge.target) }))
     .filter((edge) => edge.sourceNode && edge.targetNode);
 
-  for (let iteration = 0; iteration < 260; iteration += 1) {
-    const cooling = 1 - iteration / 260;
+  for (let iteration = 0; iteration < 360; iteration += 1) {
+    const cooling = 1 - iteration / 360;
 
     for (let i = 0; i < layoutNodes.length; i += 1) {
       const a = layoutNodes[i];
@@ -670,8 +675,8 @@ function computeConnectedPapersLayout(nodes, edges) {
         let dy = b.y - a.y;
         let distanceSq = dx * dx + dy * dy || 0.01;
         const distance = Math.sqrt(distanceSq);
-        const minDistance = a.radius + b.radius + 38;
-        const repel = Math.min(4200 / distanceSq, 2.4) * cooling;
+        const minDistance = a.radius + b.radius + 86;
+        const repel = Math.min(18000 / distanceSq, 5.2) * cooling;
         dx /= distance;
         dy /= distance;
         a.vx -= dx * repel;
@@ -680,7 +685,7 @@ function computeConnectedPapersLayout(nodes, edges) {
         b.vy += dy * repel;
 
         if (distance < minDistance) {
-          const push = (minDistance - distance) * 0.045 * cooling;
+          const push = (minDistance - distance) * 0.09 * cooling;
           a.vx -= dx * push;
           a.vy -= dy * push;
           b.vx += dx * push;
@@ -709,14 +714,14 @@ function computeConnectedPapersLayout(nodes, edges) {
     layoutNodes.forEach((item) => {
       const groupCenter = clusterCenters.get(item.cluster) || center;
       const centrality = Math.min((degree.get(item.node.id) || 0) + (item.node.frequency || 1), 18) / 18;
-      item.vx += (center.x - item.x) * (0.006 + centrality * 0.008) * cooling;
-      item.vy += (center.y - item.y) * (0.006 + centrality * 0.008) * cooling;
-      item.vx += (groupCenter.x - item.x) * 0.0035 * cooling;
-      item.vy += (groupCenter.y - item.y) * 0.0035 * cooling;
-      item.vx *= 0.72;
-      item.vy *= 0.72;
-      item.x += clamp(item.vx, -18, 18);
-      item.y += clamp(item.vy, -18, 18);
+      item.vx += (center.x - item.x) * (0.002 + centrality * 0.004) * cooling;
+      item.vy += (center.y - item.y) * (0.002 + centrality * 0.004) * cooling;
+      item.vx += (groupCenter.x - item.x) * 0.0015 * cooling;
+      item.vy += (groupCenter.y - item.y) * 0.0015 * cooling;
+      item.vx *= 0.76;
+      item.vy *= 0.76;
+      item.x += clamp(item.vx, -24, 24);
+      item.y += clamp(item.vy, -24, 24);
     });
   }
 
@@ -732,7 +737,7 @@ function sourceClusterCenters(groups, width, height) {
     return centers;
   }
 
-  const radius = Math.min(width, height) * 0.28;
+  const radius = Math.min(width, height) * 0.35;
   groups.forEach((group, index) => {
     const angle = -Math.PI / 2 + (index / groups.length) * Math.PI * 2;
     centers.set(group.sourceId, {
@@ -745,12 +750,12 @@ function sourceClusterCenters(groups, width, height) {
 
 function fitLayoutToCanvas(layoutNodes, width, height) {
   if (!layoutNodes.length) return;
-  const padding = 90;
+  const padding = 150;
   const minX = Math.min(...layoutNodes.map((item) => item.x - item.radius));
   const maxX = Math.max(...layoutNodes.map((item) => item.x + item.radius));
   const minY = Math.min(...layoutNodes.map((item) => item.y - item.radius));
   const maxY = Math.max(...layoutNodes.map((item) => item.y + item.radius));
-  const scale = Math.min((width - padding * 2) / Math.max(maxX - minX, 1), (height - padding * 2) / Math.max(maxY - minY, 1), 1.35);
+  const scale = Math.min((width - padding * 2) / Math.max(maxX - minX, 1), (height - padding * 2) / Math.max(maxY - minY, 1), 1.05);
   const offsetX = width / 2 - ((minX + maxX) / 2) * scale;
   const offsetY = height / 2 - ((minY + maxY) / 2) * scale;
   layoutNodes.forEach((item) => {
@@ -761,20 +766,20 @@ function fitLayoutToCanvas(layoutNodes, width, height) {
 
 function relationDistance(type) {
   return {
-    prerequisite: 150,
-    parallel: 118,
-    contains: 96,
-    applies_to: 138,
-  }[type] || 130;
+    prerequisite: 245,
+    parallel: 210,
+    contains: 185,
+    applies_to: 230,
+  }[type] || 220;
 }
 
 function relationStrength(type) {
   return {
-    prerequisite: 0.026,
-    parallel: 0.022,
-    contains: 0.034,
-    applies_to: 0.024,
-  }[type] || 0.022;
+    prerequisite: 0.018,
+    parallel: 0.014,
+    contains: 0.022,
+    applies_to: 0.016,
+  }[type] || 0.016;
 }
 
 function hashString(value) {
@@ -984,7 +989,7 @@ function onGraphClick(event) {
 function onGraphWheel(event) {
   event.preventDefault();
   const oldScale = state.view.scale;
-  const nextScale = clamp(oldScale * Math.exp(-event.deltaY * 0.0014), 0.45, 2.8);
+  const nextScale = clamp(oldScale * Math.exp(-event.deltaY * GRAPH_WHEEL_ZOOM_SPEED), GRAPH_MIN_SCALE, GRAPH_MAX_SCALE);
   const point = svgPoint(event);
   state.view.x = point.x - ((point.x - state.view.x) / oldScale) * nextScale;
   state.view.y = point.y - ((point.y - state.view.y) / oldScale) * nextScale;
@@ -1126,6 +1131,12 @@ function searchableText(node) {
   return [node.name, node.definition, node.category, ...(node.textbook_titles || [])].join(" ").toLowerCase();
 }
 
+function shouldShowNodeLabel(node, selected, matches, query) {
+  if (selected || matches) return true;
+  if (query) return false;
+  return (node.frequency || 1) >= 3 || (node.textbook_count || 1) >= 2;
+}
+
 function resetPreview() {
   activeTitle.textContent = "请选择或上传教材";
   exportButton.disabled = true;
@@ -1245,7 +1256,7 @@ function addChatMessage(role, content, sources) {
   if (role === "answer") {
     const body = document.createElement("div");
     body.className = "answer-body";
-    body.textContent = content;
+    body.appendChild(renderAnswerMarkdown(content));
     msg.appendChild(body);
 
     if (sources && sources.length) {
@@ -1255,7 +1266,7 @@ function addChatMessage(role, content, sources) {
       sources.forEach((source) => {
         const badge = document.createElement("span");
         badge.className = "source-item";
-        badge.textContent = `[${source.source_index}] 《${source.textbook_title}》${source.chapter_title}`;
+        badge.textContent = `[${source.source_index}] 《${source.textbook_title}》${source.chapter_title}${formatCitationLocation(source)}`;
         badge.title = source.excerpt;
         badge.addEventListener("click", () => {
           selectBook(source.textbook_id);
@@ -1270,6 +1281,98 @@ function addChatMessage(role, content, sources) {
 
   chatMessages.appendChild(msg);
   chatMessages.scrollTop = chatMessages.scrollHeight;
+}
+
+function formatCitationLocation(source) {
+  if (source.page && source.page_end && source.page !== source.page_end) return ` 第${source.page}-${source.page_end}页`;
+  if (source.page) return ` 第${source.page}页`;
+  if (source.chunk_start && source.chunk_end && source.chunk_start !== source.chunk_end) return ` 片段${source.chunk_start}-${source.chunk_end}`;
+  if (source.chunk_start) return ` 片段${source.chunk_start}`;
+  return "";
+}
+
+function renderAnswerMarkdown(content) {
+  const fragment = document.createDocumentFragment();
+  const lines = String(content || "").replace(/\r\n/g, "\n").split("\n");
+  let paragraph = [];
+  let activeList = null;
+
+  const closeList = () => {
+    activeList = null;
+  };
+
+  const flushParagraph = () => {
+    const text = paragraph.join("<br>").trim();
+    paragraph = [];
+    if (!text) return;
+    const p = document.createElement("p");
+    p.innerHTML = renderInlineMarkdown(text);
+    fragment.appendChild(p);
+  };
+
+  const appendListItem = (type, text) => {
+    if (!activeList || activeList.tagName.toLowerCase() !== type) {
+      flushParagraph();
+      const list = document.createElement(type);
+      activeList = list;
+      fragment.appendChild(list);
+    }
+    const item = document.createElement("li");
+    item.innerHTML = renderInlineMarkdown(text);
+    activeList.appendChild(item);
+  };
+
+  lines.forEach((line) => {
+    const trimmed = line.trim();
+    if (!trimmed) {
+      flushParagraph();
+      closeList();
+      return;
+    }
+
+    if (/^-{3,}$/.test(trimmed)) {
+      flushParagraph();
+      closeList();
+      fragment.appendChild(document.createElement("hr"));
+      return;
+    }
+
+    const headingMatch = trimmed.match(/^(#{1,4})\s+(.+)$/);
+    if (headingMatch) {
+      flushParagraph();
+      closeList();
+      const level = Math.min(headingMatch[1].length + 2, 5);
+      const heading = document.createElement(`h${level}`);
+      heading.innerHTML = renderInlineMarkdown(headingMatch[2]);
+      fragment.appendChild(heading);
+      return;
+    }
+
+    const unorderedMatch = trimmed.match(/^[-*]\s+(.+)$/);
+    if (unorderedMatch) {
+      appendListItem("ul", unorderedMatch[1]);
+      return;
+    }
+
+    const orderedMatch = trimmed.match(/^\d+[.)]\s+(.+)$/);
+    if (orderedMatch) {
+      appendListItem("ol", orderedMatch[1]);
+      return;
+    }
+
+    closeList();
+    paragraph.push(trimmed);
+  });
+
+  flushParagraph();
+  return fragment;
+}
+
+function renderInlineMarkdown(text) {
+  return escapeHtml(text)
+    .replace(/\*\*(.+?)\*\*/g, "<strong>$1</strong>")
+    .replace(/`([^`]+)`/g, "<code>$1</code>")
+    .replace(/\[(\d+)\]/g, '<span class="source-ref">[$1]</span>');
 }
 
 async function loadRagStatus() {
