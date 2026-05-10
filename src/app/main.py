@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import os
 import re
 import shutil
 import time
@@ -37,6 +38,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DATA_ROOT = PROJECT_ROOT / "data"
 STATIC_ROOT = PROJECT_ROOT / "src" / "web"
 SUPPORTED_SUFFIXES = {".pdf", ".md", ".markdown", ".txt", ".docx"}
+MAX_UPLOAD_BYTES = int(os.getenv("MAX_UPLOAD_BYTES", str(80 * 1024 * 1024)))
 
 app = FastAPI(title="学科知识整合智能体", version="0.2.0")
 storage = TextbookStorage(DATA_ROOT)
@@ -384,6 +386,11 @@ async def _write_upload_file(file: UploadFile, path: Path) -> tuple[int, str]:
     with path.open("wb") as target:
         while chunk := await file.read(1024 * 1024):
             size += len(chunk)
+            if size > MAX_UPLOAD_BYTES:
+                target.close()
+                path.unlink(missing_ok=True)
+                limit_mb = MAX_UPLOAD_BYTES // (1024 * 1024)
+                raise HTTPException(status_code=413, detail=f"单个文件不能超过 {limit_mb} MB")
             digest.update(chunk)
             target.write(chunk)
     return size, digest.hexdigest()

@@ -16,6 +16,7 @@ const GRAPH_NODE_LIMIT = 280;
 const GRAPH_MIN_SCALE = 0.35;
 const GRAPH_MAX_SCALE = 8;
 const GRAPH_WHEEL_ZOOM_SPEED = 0.0025;
+const MAX_UPLOAD_BYTES = 80 * 1024 * 1024;
 
 const state = {
   textbooks: [],
@@ -178,48 +179,83 @@ async function uploadFiles(fileListData) {
   const files = Array.from(fileListData || []);
   if (!files.length) return;
 
-  const formData = new FormData();
-  files.forEach((file) => formData.append("files", file));
-  state.uploadItems = files.map((file) => ({ name: file.name, size: file.size, progress: 0, status: "queued" }));
+  state.uploadItems = files.map((file) => ({
+    name: file.name,
+    size: file.size,
+    progress: 0,
+    status: file.size > MAX_UPLOAD_BYTES ? "skipped" : "queued",
+    error: file.size > MAX_UPLOAD_BYTES ? `超过 ${formatSize(MAX_UPLOAD_BYTES)}，请压缩或拆分后再上传` : "",
+  }));
   renderUploadProgress();
+
+  const uploadableFiles = files.filter((file) => file.size <= MAX_UPLOAD_BYTES);
+  if (!uploadableFiles.length) {
+    alert(`单个文件不能超过 ${formatSize(MAX_UPLOAD_BYTES)}。Render 免费实例不适合直接上传超大 PDF。`);
+    fileInput.value = "";
+    return;
+  }
+
   setUploading(true);
 
+  let failedCount = state.uploadItems.filter((item) => item.status === "skipped").length;
   try {
-    await uploadWithProgress(formData);
-    state.uploadItems = state.uploadItems.map((item) => ({ ...item, progress: 100, status: "completed" }));
-    renderUploadProgress();
+    for (const file of uploadableFiles) {
+      markUploadItem(file, { status: "uploading", progress: 0, error: "" });
+      try {
+        await uploadWithProgress(file, (progress) => {
+          markUploadItem(file, { progress, status: progress >= 100 ? "processing" : "uploading" });
+        });
+        markUploadItem(file, { progress: 100, status: "completed", error: "" });
+      } catch (error) {
+        failedCount += 1;
+        markUploadItem(file, { status: "failed", error: error.message || "上传失败" });
+      }
+    }
     await loadTextbooks();
-  } catch (error) {
-    state.uploadItems = state.uploadItems.map((item) => ({ ...item, status: item.status === "completed" ? item.status : "failed" }));
-    renderUploadProgress();
-    alert(error.message || "上传失败");
+    if (failedCount) alert("部分文件上传失败，请查看进度列表中的提示。");
   } finally {
     setUploading(false);
     fileInput.value = "";
   }
 }
 
-function uploadWithProgress(formData) {
+function uploadWithProgress(file, onProgress) {
   return new Promise((resolve, reject) => {
+    const formData = new FormData();
+    formData.append("files", file);
     const xhr = new XMLHttpRequest();
     xhr.open("POST", "/api/textbooks/upload");
     xhr.upload.addEventListener("progress", (event) => {
       if (!event.lengthComputable) return;
       const progress = Math.round((event.loaded / event.total) * 100);
-      state.uploadItems = state.uploadItems.map((item) => ({
-        ...item,
-        progress,
-        status: progress >= 100 ? "processing" : "uploading",
-      }));
-      renderUploadProgress();
+      onProgress(progress);
     });
     xhr.addEventListener("load", () => {
-      if (xhr.status >= 200 && xhr.status < 300) resolve(JSON.parse(xhr.responseText || "{}"));
-      else reject(new Error(xhr.responseText || "上传失败"));
+      if (xhr.status >= 200 && xhr.status < 300) {
+        resolve(JSON.parse(xhr.responseText || "{}"));
+        return;
+      }
+      reject(new Error(readUploadError(xhr)));
     });
     xhr.addEventListener("error", () => reject(new Error("上传失败")));
     xhr.send(formData);
   });
+}
+
+function markUploadItem(file, patch) {
+  state.uploadItems = state.uploadItems.map((item) =>
+    item.name === file.name && item.size === file.size ? { ...item, ...patch } : item,
+  );
+  renderUploadProgress();
+}
+
+function readUploadError(xhr) {
+  try {
+    const data = JSON.parse(xhr.responseText || "{}");
+    return data.detail || data.message || "上传失败";
+  } catch {
+    return xhr.responseText || "上传失败";
+  }
 }
 
 function renderUploadProgress() {
@@ -235,7 +271,8 @@ function renderUploadProgress() {
   const average = Math.round(state.uploadItems.reduce((sum, item) => sum + item.progress, 0) / state.uploadItems.length);
   const allDone = state.uploadItems.every((item) => item.status === "completed");
   const hasFailed = state.uploadItems.some((item) => item.status === "failed");
-  uploadProgressSummary.textContent = hasFailed ? "上传失败" : allDone ? "100%" : `${average}%`;
+  const hasSkipped = state.uploadItems.some((item) => item.status === "skipped");
+  uploadProgressSummary.textContent = hasFailed ? "部分失败" : hasSkipped ? "有文件过大" : allDone ? "100%" : `${average}%`;
   uploadProgressSummary.className = `status-pill ${hasFailed ? "failed" : allDone ? "" : "parsing"}`;
   uploadProgressList.innerHTML = state.uploadItems
     .map(
@@ -243,7 +280,7 @@ function renderUploadProgress() {
         <div class="progress-row">
           <div class="progress-row-meta">
             <strong>${escapeHtml(item.name)}</strong>
-            <span>${uploadStatusText(item.status)} · ${formatSize(item.size)}</span>
+            <span>${uploadStatusText(item.status)} · ${formatSize(item.size)}${item.error ? ` · ${escapeHtml(item.error)}` : ""}</span>
           </div>
           <div class="progress-track"><i style="width:${clamp(item.progress, 0, 100)}%"></i></div>
           <span class="progress-value">${clamp(item.progress, 0, 100)}%</span>
@@ -260,6 +297,7 @@ function uploadStatusText(status) {
     processing: "服务器解析中",
     completed: "完成",
     failed: "失败",
+    skipped: "文件过大",
   }[status] || status;
 }
 
