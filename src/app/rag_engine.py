@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import re
 
 from .chunker import chunk_textbook_chapters
 from .config import get_modelscope_settings, get_rag_settings
@@ -18,7 +19,23 @@ RAG_SYSTEM_PROMPT = """你是医学教材知识问答助手。请严格基于下
 2. 如果原文片段不足以回答问题，请明确说明"根据提供的教材内容，无法回答此问题"。
 3. 回答时尽量引用原文的具体表述，并在引用处标注来源编号，例如 [1]、[2]。
 4. 回答应条理清晰，先给出结论，再分点展开。
-5. 如果不同教材对同一问题有不同表述，请并列呈现。"""
+5. 如果不同教材对同一问题有不同表述，请并列呈现。
+6. 只允许使用本轮提供的来源编号，不要保留或仿写教材原文中的论文参考文献编号，例如 [148]。"""
+
+
+SOURCE_REF_PATTERN = re.compile(r"\[(\d+)\]")
+
+
+def _sanitize_answer(answer: str, source_count: int) -> str:
+    """Drop citation-looking numbers that are not source ids for this answer."""
+
+    def replace_ref(match: re.Match[str]) -> str:
+        source_index = int(match.group(1))
+        if 1 <= source_index <= source_count:
+            return match.group(0)
+        return ""
+
+    return SOURCE_REF_PATTERN.sub(replace_ref, answer).strip()
 
 
 def _source_key(chunk: dict) -> tuple:
@@ -46,11 +63,15 @@ def _group_chunks_by_source(chunks: list[dict]) -> list[dict]:
                 "chunk_start": chunk.get("chunk_index") or 0,
                 "chunk_end": chunk.get("chunk_index") or 0,
                 "score": 0.0,
+                "vector_score": 0.0,
+                "keyword_score": 0.0,
                 "chunks": [],
             },
         )
         source["chunks"].append(chunk)
         source["score"] = max(source["score"], chunk.get("score", 0.0))
+        source["vector_score"] = max(source["vector_score"], chunk.get("vector_score", 0.0))
+        source["keyword_score"] = max(source["keyword_score"], chunk.get("keyword_score", 0.0))
         chunk_index = chunk.get("chunk_index") or 0
         source["chunk_start"] = min(source["chunk_start"], chunk_index)
         source["chunk_end"] = max(source["chunk_end"], chunk_index)
@@ -105,6 +126,8 @@ def _build_sources(sources: list[dict]) -> list[SourceCitation]:
             chunk_count=len(source.get("chunks", [])),
             excerpt="\n".join(chunk["content"] for chunk in source.get("chunks", []))[:500],
             score=round(source.get("score", 0.0), 4),
+            vector_score=round(source.get("vector_score", 0.0), 4),
+            keyword_score=round(source.get("keyword_score", 0.0), 4),
         )
         for i, source in enumerate(sources)
     ]
@@ -134,6 +157,7 @@ class RagEngine:
         context = _build_context(sources)
         messages = [
             {"role": "system", "content": RAG_SYSTEM_PROMPT},
+            *_history_messages(request.history),
             {
                 "role": "user",
                 "content": f"教材原文片段：\n\n{context}\n\n用户问题：{request.question}",
@@ -146,7 +170,7 @@ class RagEngine:
 
         return RagQueryResponse(
             question=request.question,
-            answer=answer.strip(),
+            answer=_sanitize_answer(answer, len(sources)),
             sources=_build_sources(sources),
             model=settings.model,
         )
@@ -193,3 +217,16 @@ class RagEngine:
             count = self.ensure_indexed(summary.textbook_id)
             results[summary.textbook_id] = count
         return results
+
+
+def _history_messages(history: list[dict[str, str]]) -> list[dict[str, str]]:
+    messages: list[dict[str, str]] = []
+    for item in history[-6:]:
+        role = item.get("role", "")
+        if role not in {"user", "assistant"}:
+            continue
+        content = str(item.get("content", "")).strip()
+        if not content:
+            continue
+        messages.append({"role": role, "content": content[:1200]})
+    return messages

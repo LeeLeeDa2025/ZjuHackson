@@ -2,6 +2,9 @@ from __future__ import annotations
 
 import json
 import logging
+import math
+import re
+from collections import Counter
 from pathlib import Path
 
 import numpy as np
@@ -139,19 +142,31 @@ class VectorStore:
                 continue
 
             similarities = np.dot(embeddings, query_vec)
-            top_indices = np.argsort(similarities)[-top_k:][::-1]
 
-            for idx in top_indices:
+            for idx, similarity in enumerate(similarities):
                 chunk = dict(chunks[idx])
-                score = float(similarities[idx])
+                score = max(0.0, float(similarity))
                 all_items.append(
                     {
                         "chunk_id": chunk.get("chunk_id", ""),
                         "content": chunk.pop("content", ""),
-                        "score": max(0.0, score),
+                        "vector_score": score,
                         **chunk,
                     }
                 )
+
+        if not all_items:
+            return []
+
+        keyword_scores = _bm25_scores(query, [item["content"] for item in all_items])
+        vector_scores = _normalize_scores([item["vector_score"] for item in all_items])
+        keyword_scores = _normalize_scores(keyword_scores)
+
+        for item, vector_score, keyword_score in zip(all_items, vector_scores, keyword_scores, strict=True):
+            final_score = 0.7 * vector_score + 0.3 * keyword_score
+            item["score"] = final_score
+            item["vector_score"] = vector_score
+            item["keyword_score"] = keyword_score
 
         all_items.sort(key=lambda x: x["score"], reverse=True)
         return all_items[:top_k]
@@ -159,3 +174,49 @@ class VectorStore:
     def rebuild_for_textbook(self, textbook_id: str, chunks: list[TextChunk]) -> int:
         self.remove_textbook(textbook_id)
         return self.index_chunks(chunks)
+
+
+def _bm25_scores(query: str, documents: list[str]) -> list[float]:
+    query_terms = _tokenize(query)
+    if not query_terms or not documents:
+        return [0.0 for _ in documents]
+
+    doc_terms = [_tokenize(document) for document in documents]
+    doc_lengths = [len(terms) for terms in doc_terms]
+    average_length = sum(doc_lengths) / max(len(doc_lengths), 1) or 1.0
+    document_frequency = Counter(term for terms in doc_terms for term in set(terms))
+    total_docs = len(doc_terms)
+    k1 = 1.5
+    b = 0.75
+    scores: list[float] = []
+
+    for terms, length in zip(doc_terms, doc_lengths, strict=True):
+        term_counts = Counter(terms)
+        score = 0.0
+        for term in query_terms:
+            frequency = term_counts.get(term, 0)
+            if not frequency:
+                continue
+            idf = math.log(1 + (total_docs - document_frequency[term] + 0.5) / (document_frequency[term] + 0.5))
+            denominator = frequency + k1 * (1 - b + b * length / average_length)
+            score += idf * (frequency * (k1 + 1)) / denominator
+        scores.append(score)
+    return scores
+
+
+def _tokenize(text: str) -> list[str]:
+    normalized = text.lower()
+    words = re.findall(r"[a-z0-9]+", normalized)
+    chinese_chars = re.findall(r"[\u4e00-\u9fff]", normalized)
+    chinese_bigrams = [f"{chinese_chars[i]}{chinese_chars[i + 1]}" for i in range(len(chinese_chars) - 1)]
+    return words + chinese_chars + chinese_bigrams
+
+
+def _normalize_scores(scores: list[float]) -> list[float]:
+    if not scores:
+        return []
+    low = min(scores)
+    high = max(scores)
+    if high <= low:
+        return [1.0 if score > 0 else 0.0 for score in scores]
+    return [(score - low) / (high - low) for score in scores]

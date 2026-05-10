@@ -1,5 +1,17 @@
 const SOURCE_COLORS = ["#12715d", "#3267a8", "#b76e00", "#7b6ab5", "#b42318", "#4f7f2a", "#a1447a"];
 const RELATION_ORDER = ["prerequisite", "parallel", "contains", "applies_to"];
+const RELATION_LABELS = {
+  prerequisite: "前置依赖",
+  parallel: "并列关系",
+  contains: "包含关系",
+  applies_to: "应用关系",
+};
+const CATEGORY_SHAPES = [
+  { key: "disease", label: "疾病/病理", shape: "diamond", keywords: ["疾病", "病", "感染", "炎症", "综合征"] },
+  { key: "structure", label: "结构/组织", shape: "square", keywords: ["结构", "组织", "器官", "细胞", "解剖"] },
+  { key: "mechanism", label: "机制/过程", shape: "triangle", keywords: ["机制", "过程", "功能", "调控", "代谢", "反应"] },
+  { key: "method", label: "方法/检查", shape: "hexagon", keywords: ["检查", "诊断", "治疗", "方法", "实验", "技术"] },
+];
 const GRAPH_NODE_LIMIT = 280;
 const GRAPH_MIN_SCALE = 0.35;
 const GRAPH_MAX_SCALE = 8;
@@ -10,15 +22,19 @@ const state = {
   activeBook: null,
   activeChapterId: null,
   graph: null,
+  graphMergeMode: "merged",
   graphPositions: new Map(),
   graphLayoutKey: "",
   selectedNodeId: null,
   searchQuery: "",
+  graphView: "graph",
+  relationFilter: new Set(RELATION_ORDER),
   view: { scale: 1, x: 0, y: 0 },
   pointer: null,
   suppressGraphClick: false,
   uploadItems: [],
   buildSteps: [],
+  ragHistory: [],
 };
 
 const fileInput = document.querySelector("#fileInput");
@@ -35,10 +51,14 @@ const graphButton = document.querySelector("#graphButton");
 const graphScopeSelect = document.querySelector("#graphScopeSelect");
 const graphStatus = document.querySelector("#graphStatus");
 const graphSvg = document.querySelector("#graphSvg");
+const graphMatrix = document.querySelector("#graphMatrix");
 const graphStats = document.querySelector("#graphStats");
 const graphSearch = document.querySelector("#graphSearch");
+const graphMergeModeSelect = document.querySelector("#graphMergeModeSelect");
 const graphLegend = document.querySelector("#graphLegend");
 const resetViewButton = document.querySelector("#resetViewButton");
+const graphViewButtons = document.querySelectorAll("[data-graph-view]");
+const relationFilterInputs = document.querySelectorAll("[data-relation-filter]");
 const nodeDetail = document.querySelector("#nodeDetail");
 const detailFrequency = document.querySelector("#detailFrequency");
 const modelscopeStatus = document.querySelector("#modelscopeStatus");
@@ -53,6 +73,11 @@ exportButton.addEventListener("click", exportActiveBook);
 graphButton.addEventListener("click", buildKnowledgeGraphByScope);
 graphScopeSelect.addEventListener("change", () => {
   if (graphScopeSelect.value !== "all") selectBook(graphScopeSelect.value);
+  else loadAggregateGraph();
+});
+graphMergeModeSelect.addEventListener("change", () => {
+  state.graphMergeMode = graphMergeModeSelect.value;
+  loadAggregateGraph();
 });
 graphSearch.addEventListener("input", () => {
   state.searchQuery = graphSearch.value.trim().toLowerCase();
@@ -61,6 +86,22 @@ graphSearch.addEventListener("input", () => {
 resetViewButton.addEventListener("click", () => {
   state.view = { scale: 1, x: 0, y: 0 };
   renderKnowledgeGraph();
+});
+graphViewButtons.forEach((button) => {
+  button.addEventListener("click", () => {
+    state.graphView = button.dataset.graphView || "graph";
+    renderKnowledgeGraph();
+  });
+});
+relationFilterInputs.forEach((input) => {
+  input.addEventListener("change", () => {
+    state.relationFilter = new Set(
+      Array.from(relationFilterInputs)
+        .filter((item) => item.checked)
+        .map((item) => item.value),
+    );
+    renderKnowledgeGraph();
+  });
 });
 
 graphSvg.addEventListener("wheel", onGraphWheel, { passive: false });
@@ -114,7 +155,8 @@ async function loadTextbooks() {
 }
 
 async function loadAggregateGraph() {
-  const response = await fetch("/api/knowledge-graph");
+  const merged = state.graphMergeMode !== "source";
+  const response = await fetch(`/api/knowledge-graph?merged=${merged ? "true" : "false"}`);
   if (!response.ok) return loadActiveGraphFallback();
   state.graph = await response.json();
   ensureGraphPositions();
@@ -497,6 +539,7 @@ function setUploading(isUploading) {
 function setGraphBusy(isBusy) {
   graphButton.disabled = isBusy || !state.textbooks.length;
   graphScopeSelect.disabled = isBusy || !state.textbooks.length;
+  graphMergeModeSelect.disabled = isBusy;
   if (isBusy) {
     graphStatus.textContent = "生成中";
     graphStatus.className = "status-pill parsing";
@@ -505,25 +548,43 @@ function setGraphBusy(isBusy) {
 
 function renderKnowledgeGraph() {
   graphSvg.innerHTML = "";
+  graphMatrix.innerHTML = "";
   renderLegend();
+  renderGraphViewControls();
   if (!state.graph || !state.graph.nodes.length) {
     graphStatus.textContent = "未生成";
     graphStatus.className = "status-pill muted";
     graphStats.textContent = "选择构建范围后点击生成。";
+    graphSvg.classList.remove("hidden");
+    graphMatrix.classList.add("hidden");
     renderNodeDetail(null);
     return;
   }
 
   ensureGraphPositions();
+  const visibleNodes = state.graph.nodes.slice(0, GRAPH_NODE_LIMIT);
+  const visibleIds = new Set(visibleNodes.map((node) => node.id));
+  const filteredEdges = filteredGraphEdges(state.graph, visibleIds);
   graphStatus.textContent = "可交互";
   graphStatus.className = "status-pill";
-  graphStats.textContent = `${state.graph.nodes.length} 个知识点 · ${state.graph.edges.length} 条关系 · ${state.graph.textbook_count} 本教材来源`;
-  drawGraph(state.graph);
+  const mergeHint =
+    state.graph.merge_mode === "merged" && state.graph.raw_node_count
+      ? ` · 已由 ${state.graph.raw_node_count} 个原始节点融合为 ${state.graph.merged_node_count || state.graph.nodes.length} 个`
+      : " · 原始来源视图";
+  graphStats.textContent = `${state.graph.nodes.length} 个知识点 · ${filteredEdges.length}/${state.graph.edges.length} 条关系 · ${state.graph.textbook_count} 本教材来源${mergeHint}`;
+  if (state.graphView === "matrix") {
+    graphSvg.classList.add("hidden");
+    graphMatrix.classList.remove("hidden");
+    renderKnowledgeMatrix(state.graph, visibleNodes, filteredEdges);
+  } else {
+    graphSvg.classList.remove("hidden");
+    graphMatrix.classList.add("hidden");
+    drawGraph(state.graph, visibleNodes, filteredEdges);
+  }
   renderNodeDetail(state.graph.nodes.find((node) => node.id === state.selectedNodeId) || null);
 }
 
-function drawGraph(graph) {
-  const visibleNodes = graph.nodes.slice(0, GRAPH_NODE_LIMIT);
+function drawGraph(graph, visibleNodes, filteredEdges) {
   const visibleIds = new Set(visibleNodes.map((node) => node.id));
   const { width, height } = graphCanvasSize(visibleNodes);
   const query = state.searchQuery;
@@ -536,8 +597,7 @@ function drawGraph(graph) {
   });
   graphSvg.appendChild(viewport);
 
-  graph.edges.forEach((edge) => {
-    if (!visibleIds.has(edge.source) || !visibleIds.has(edge.target)) return;
+  filteredEdges.forEach((edge) => {
     const source = state.graphPositions.get(edge.source);
     const target = state.graphPositions.get(edge.target);
     if (!source || !target) return;
@@ -570,7 +630,7 @@ function drawGraph(graph) {
       role: "button",
     });
     group.appendChild(svgElement("circle", { r: radius + 16, class: "node-hit-area" }));
-    group.appendChild(svgElement("circle", { r: radius, fill: sourceColor(node), "fill-opacity": nodeOpacity(node) }));
+    group.appendChild(nodeShapeElement(node, radius));
     group.appendChild(svgElement("circle", { r: Math.max(radius - 7, 5), class: "node-core" }));
     sourceMarkers(node, radius).forEach((marker) => group.appendChild(marker));
     const text = svgElement("text", { y: radius + 16, "text-anchor": "middle" });
@@ -598,6 +658,173 @@ function drawGraph(graph) {
     });
     viewport.appendChild(group);
   });
+}
+
+function filteredGraphEdges(graph, visibleIds) {
+  return graph.edges.filter((edge) => visibleIds.has(edge.source) && visibleIds.has(edge.target) && state.relationFilter.has(edge.relation_type));
+}
+
+function renderGraphViewControls() {
+  graphViewButtons.forEach((button) => {
+    button.classList.toggle("active", button.dataset.graphView === state.graphView);
+  });
+  relationFilterInputs.forEach((input) => {
+    input.checked = state.relationFilter.has(input.value);
+  });
+}
+
+function nodeShapeElement(node, radius) {
+  const shape = categoryShape(node).shape;
+  const attributes = {
+    class: `node-shape ${shape}`,
+    fill: sourceColor(node),
+    "fill-opacity": nodeOpacity(node),
+  };
+  if (shape === "circle") return svgElement("circle", { ...attributes, r: radius });
+  if (shape === "square") {
+    return svgElement("rect", {
+      ...attributes,
+      x: -radius,
+      y: -radius,
+      width: radius * 2,
+      height: radius * 2,
+      rx: Math.max(4, radius * 0.18),
+    });
+  }
+  return svgElement("polygon", { ...attributes, points: shapePoints(shape, radius) });
+}
+
+function shapePoints(shape, radius) {
+  if (shape === "triangle") {
+    return `0 ${-radius} ${radius * 0.92} ${radius * 0.78} ${-radius * 0.92} ${radius * 0.78}`;
+  }
+  if (shape === "diamond") {
+    return `0 ${-radius} ${radius} 0 0 ${radius} ${-radius} 0`;
+  }
+  if (shape === "hexagon") {
+    return `0 ${-radius} ${radius * 0.86} ${-radius * 0.5} ${radius * 0.86} ${radius * 0.5} 0 ${radius} ${-radius * 0.86} ${radius * 0.5} ${-radius * 0.86} ${-radius * 0.5}`;
+  }
+  return `0 ${-radius} ${radius} 0 0 ${radius} ${-radius} 0`;
+}
+
+function categoryShape(node) {
+  const category = String(node.category || node.name || "").toLowerCase();
+  return CATEGORY_SHAPES.find((item) => item.keywords.some((keyword) => category.includes(keyword.toLowerCase()))) || {
+    key: "concept",
+    label: "概念/术语",
+    shape: "circle",
+  };
+}
+
+function renderKnowledgeMatrix(graph, visibleNodes, filteredEdges) {
+  const nodeById = new Map(visibleNodes.map((node) => [node.id, node]));
+  const rows = matrixRows(visibleNodes);
+  const columns = matrixColumns(visibleNodes);
+  const cells = new Map();
+
+  rows.forEach((row) => {
+    columns.forEach((column) => {
+      cells.set(matrixKey(row.id, column.key), { nodeIds: new Set(), relationCount: 0 });
+    });
+  });
+
+  visibleNodes.forEach((node) => {
+    const column = categoryShape(node).key;
+    nodeSourceIds(node).forEach((sourceId) => {
+      const cell = cells.get(matrixKey(sourceId, column));
+      if (cell) cell.nodeIds.add(node.id);
+    });
+  });
+
+  filteredEdges.forEach((edge) => {
+    [nodeById.get(edge.source), nodeById.get(edge.target)].filter(Boolean).forEach((node) => {
+      const column = categoryShape(node).key;
+      nodeSourceIds(node).forEach((sourceId) => {
+        const cell = cells.get(matrixKey(sourceId, column));
+        if (cell) cell.relationCount += edge.frequency || 1;
+      });
+    });
+  });
+
+  const maxRelationCount = Math.max(1, ...Array.from(cells.values()).map((cell) => cell.relationCount));
+  graphMatrix.innerHTML = `
+    <div class="matrix-summary">
+      <strong>知识矩阵</strong>
+      <span>按教材来源 × 知识类别聚合，颜色越深表示该类别关联越密集。</span>
+    </div>
+    <div class="matrix-scroll">
+      <table class="matrix-table">
+        <thead>
+          <tr>
+            <th>教材 / 类别</th>
+            ${columns.map((column) => `<th><span class="shape-sample ${column.shape}"></span>${escapeHtml(column.label)}</th>`).join("")}
+          </tr>
+        </thead>
+        <tbody>
+          ${rows
+            .map(
+              (row) => `
+                <tr>
+                  <th>${escapeHtml(row.label)}</th>
+                  ${columns
+                    .map((column) => {
+                      const cell = cells.get(matrixKey(row.id, column.key));
+                      const intensity = cell ? cell.relationCount / maxRelationCount : 0;
+                      const nodeCount = cell?.nodeIds.size || 0;
+                      const relationCount = cell?.relationCount || 0;
+                      return `
+                        <td>
+                          <button class="matrix-cell" type="button" style="--heat:${intensity.toFixed(2)}" title="${escapeHtml(row.label)} · ${escapeHtml(column.label)}">
+                            <strong>${formatNumber(nodeCount)}</strong>
+                            <span>${formatNumber(relationCount)} 关系</span>
+                          </button>
+                        </td>
+                      `;
+                    })
+                    .join("")}
+                </tr>
+              `,
+            )
+            .join("")}
+        </tbody>
+      </table>
+    </div>
+  `;
+}
+
+function matrixRows(nodes) {
+  const rows = new Map();
+  nodes.forEach((node) => {
+    const ids = nodeSourceIds(node);
+    const titles = node.textbook_titles || [];
+    ids.forEach((id, index) => {
+      if (!rows.has(id)) {
+        const known = state.textbooks.find((book) => book.textbook_id === id);
+        rows.set(id, { id, label: known?.title || titles[index] || "未知教材" });
+      }
+    });
+  });
+  return Array.from(rows.values());
+}
+
+function matrixColumns(nodes) {
+  const seen = new Set();
+  const columns = [];
+  nodes.forEach((node) => {
+    const shape = categoryShape(node);
+    if (seen.has(shape.key)) return;
+    seen.add(shape.key);
+    columns.push(shape);
+  });
+  return columns.sort((a, b) => a.label.localeCompare(b.label, "zh-CN"));
+}
+
+function nodeSourceIds(node) {
+  return node.textbook_ids?.length ? node.textbook_ids : ["unknown"];
+}
+
+function matrixKey(rowId, columnKey) {
+  return `${rowId}::${columnKey}`;
 }
 
 function ensureGraphPositions() {
@@ -824,10 +1051,15 @@ function renderLegend() {
   relationGroup.className = "legend-group";
   relationGroup.innerHTML = `
     <strong>关系类型</strong>
-    <span class="legend-item"><i class="edge-sample prerequisite"></i>前置依赖</span>
-    <span class="legend-item"><i class="edge-sample parallel"></i>并列关系</span>
-    <span class="legend-item"><i class="edge-sample contains"></i>包含关系</span>
-    <span class="legend-item"><i class="edge-sample applies_to"></i>应用关系</span>
+    ${RELATION_ORDER.map((type) => `<span class="legend-item"><i class="edge-sample ${type}"></i>${RELATION_LABELS[type]}</span>`).join("")}
+  `;
+
+  const categoryGroup = document.createElement("div");
+  categoryGroup.className = "legend-group";
+  categoryGroup.innerHTML = `
+    <strong>类别形状</strong>
+    <span class="legend-item"><i class="shape-sample circle"></i>概念/术语</span>
+    ${CATEGORY_SHAPES.map((item) => `<span class="legend-item"><i class="shape-sample ${item.shape}"></i>${item.label}</span>`).join("")}
   `;
 
   const frequencyGroup = document.createElement("div");
@@ -839,7 +1071,7 @@ function renderLegend() {
     <span class="legend-item frequency-sample"><i class="freq-dot high"></i>高频</span>
     <span class="legend-note">节点越大、颜色越深，表示出现次数越多</span>
   `;
-  graphLegend.append(sourceGroup, relationGroup, frequencyGroup);
+  graphLegend.append(sourceGroup, relationGroup, categoryGroup, frequencyGroup);
 }
 
 function renderNodeDetail(node) {
@@ -860,7 +1092,7 @@ function renderNodeDetail(node) {
       (source) => `
         <li>
           <strong>${escapeHtml(source.textbook_title)}</strong>
-          <span>${escapeHtml(source.chapter || "未知章节")} · ${source.page ? `第 ${source.page} 页` : "无页码"}</span>
+          <span>${escapeHtml(source.chapter || "未知章节")} · ${source.page ? `第 ${source.page} 页` : "无页码"} · 置信度 ${formatPercent(source.confidence ?? node.confidence ?? 1)}</span>
           <p>${escapeHtml(source.source_excerpt || source.definition || "暂无原文摘录")}</p>
         </li>
       `,
@@ -898,6 +1130,8 @@ function renderNodeDetail(node) {
       <dd>${escapeHtml(node.category || "未分类")}</dd>
       <dt>出现频次</dt>
       <dd>${formatNumber(node.frequency || 0)} 次，覆盖 ${formatNumber(node.textbook_count || 0)} 本教材</dd>
+      <dt>抽取置信度</dt>
+      <dd>${formatPercent(node.confidence ?? 1)}</dd>
       <dt>教材来源</dt>
       <dd>${node.textbook_titles.map(escapeHtml).join("、")}</dd>
     </dl>
@@ -949,7 +1183,8 @@ function graphToAggregate(graph) {
       textbook_count: 1,
       textbook_ids: [graph.textbook_id],
       textbook_titles: [graph.title],
-      sources: [{ textbook_id: graph.textbook_id, textbook_title: graph.title, chapter: node.chapter, page: node.page, definition: node.definition, source_excerpt: node.source_excerpt, node_id: node.id }],
+      confidence: node.confidence ?? 1,
+      sources: [{ textbook_id: graph.textbook_id, textbook_title: graph.title, chapter: node.chapter, page: node.page, definition: node.definition, source_excerpt: node.source_excerpt, confidence: node.confidence ?? 1, node_id: node.id }],
       original_id: node.id,
     })),
     edges: graph.edges.map((edge) => ({
@@ -1186,6 +1421,12 @@ function formatCompact(value) {
   return formatNumber(value);
 }
 
+function formatPercent(value) {
+  const number = Number(value);
+  if (!Number.isFinite(number)) return "未知";
+  return `${Math.round(clamp(number, 0, 1) * 100)}%`;
+}
+
 function escapeHtml(value) {
   return String(value ?? "")
     .replaceAll("&", "&amp;")
@@ -1225,7 +1466,7 @@ async function sendRagQuery(event) {
   ragStatus.className = "status-pill parsing";
 
   try {
-    const body = { question, top_k: 5 };
+    const body = { question, top_k: 8, history: state.ragHistory.slice(-6) };
     if (graphScopeSelect.value !== "all" && state.activeBook?.textbook_id) {
       body.textbook_ids = [state.activeBook.textbook_id];
     }
@@ -1237,6 +1478,8 @@ async function sendRagQuery(event) {
     const data = await response.json();
     if (!response.ok) throw new Error(data.detail || "问答请求失败");
     addChatMessage("answer", data.answer, data.sources || []);
+    state.ragHistory.push({ role: "user", content: question }, { role: "assistant", content: data.answer });
+    state.ragHistory = state.ragHistory.slice(-8);
     ragStatus.textContent = "就绪";
     ragStatus.className = "status-pill";
   } catch (error) {
@@ -1256,7 +1499,7 @@ function addChatMessage(role, content, sources) {
   if (role === "answer") {
     const body = document.createElement("div");
     body.className = "answer-body";
-    body.appendChild(renderAnswerMarkdown(content));
+    body.appendChild(renderAnswerMarkdown(content, sources || []));
     msg.appendChild(body);
 
     if (sources && sources.length) {
@@ -1266,8 +1509,8 @@ function addChatMessage(role, content, sources) {
       sources.forEach((source) => {
         const badge = document.createElement("span");
         badge.className = "source-item";
-        badge.textContent = `[${source.source_index}] 《${source.textbook_title}》${source.chapter_title}${formatCitationLocation(source)}`;
-        badge.title = source.excerpt;
+        badge.textContent = `[${source.source_index}] 《${source.textbook_title}》${source.chapter_title}${formatCitationLocation(source)} · 相关度 ${formatPercent(source.score)}`;
+        badge.title = `${source.excerpt}\n向量：${formatPercent(source.vector_score)}，关键词：${formatPercent(source.keyword_score)}`;
         badge.addEventListener("click", () => {
           selectBook(source.textbook_id);
         });
@@ -1291,11 +1534,13 @@ function formatCitationLocation(source) {
   return "";
 }
 
-function renderAnswerMarkdown(content) {
+function renderAnswerMarkdown(content, sources = []) {
   const fragment = document.createDocumentFragment();
   const lines = String(content || "").replace(/\r\n/g, "\n").split("\n");
+  const maxSourceIndex = getMaxSourceIndex(sources);
   let paragraph = [];
   let activeList = null;
+  let sectionNumber = 0;
 
   const closeList = () => {
     activeList = null;
@@ -1306,11 +1551,11 @@ function renderAnswerMarkdown(content) {
     paragraph = [];
     if (!text) return;
     const p = document.createElement("p");
-    p.innerHTML = renderInlineMarkdown(text);
+    p.innerHTML = renderInlineMarkdown(text, maxSourceIndex);
     fragment.appendChild(p);
   };
 
-  const appendListItem = (type, text) => {
+  const appendListItem = (type, text, value = null) => {
     if (!activeList || activeList.tagName.toLowerCase() !== type) {
       flushParagraph();
       const list = document.createElement(type);
@@ -1318,7 +1563,8 @@ function renderAnswerMarkdown(content) {
       fragment.appendChild(list);
     }
     const item = document.createElement("li");
-    item.innerHTML = renderInlineMarkdown(text);
+    if (type === "ol" && value) item.value = value;
+    item.innerHTML = renderInlineMarkdown(text, maxSourceIndex);
     activeList.appendChild(item);
   };
 
@@ -1343,7 +1589,18 @@ function renderAnswerMarkdown(content) {
       closeList();
       const level = Math.min(headingMatch[1].length + 2, 5);
       const heading = document.createElement(`h${level}`);
-      heading.innerHTML = renderInlineMarkdown(headingMatch[2]);
+      heading.innerHTML = renderInlineMarkdown(headingMatch[2], maxSourceIndex);
+      fragment.appendChild(heading);
+      return;
+    }
+
+    const orderedHeadingMatch = trimmed.match(/^\d+[.)]\s+(\*\*.+?\*\*\s*[:：]?)$/);
+    if (orderedHeadingMatch) {
+      flushParagraph();
+      closeList();
+      sectionNumber += 1;
+      const heading = document.createElement("h4");
+      heading.innerHTML = `${sectionNumber}. ${renderInlineMarkdown(orderedHeadingMatch[1], maxSourceIndex)}`;
       fragment.appendChild(heading);
       return;
     }
@@ -1354,9 +1611,9 @@ function renderAnswerMarkdown(content) {
       return;
     }
 
-    const orderedMatch = trimmed.match(/^\d+[.)]\s+(.+)$/);
+    const orderedMatch = trimmed.match(/^(\d+)[.)]\s+(.+)$/);
     if (orderedMatch) {
-      appendListItem("ol", orderedMatch[1]);
+      appendListItem("ol", orderedMatch[2], Number(orderedMatch[1]));
       return;
     }
 
@@ -1368,11 +1625,19 @@ function renderAnswerMarkdown(content) {
   return fragment;
 }
 
-function renderInlineMarkdown(text) {
+function getMaxSourceIndex(sources) {
+  return sources.reduce((maxIndex, source) => Math.max(maxIndex, Number(source.source_index) || 0), 0);
+}
+
+function renderInlineMarkdown(text, maxSourceIndex = 0) {
   return escapeHtml(text)
     .replace(/\*\*(.+?)\*\*/g, "<strong>$1</strong>")
     .replace(/`([^`]+)`/g, "<code>$1</code>")
-    .replace(/\[(\d+)\]/g, '<span class="source-ref">[$1]</span>');
+    .replace(/\[(\d+)\]/g, (match, index) => {
+      const sourceIndex = Number(index);
+      if (sourceIndex < 1 || sourceIndex > maxSourceIndex) return match;
+      return `<span class="source-ref">[${sourceIndex}]</span>`;
+    });
 }
 
 async function loadRagStatus() {

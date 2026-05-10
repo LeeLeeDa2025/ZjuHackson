@@ -84,6 +84,7 @@ async def build_knowledge_graph(
                         chapter=str(raw_node.get("chapter", chapter.title)).strip() or chapter.title,
                         page=_coerce_page(raw_node.get("page")) or chapter.page_start,
                         source_excerpt=str(raw_node.get("source_excerpt", "")).strip() or None,
+                        confidence=_coerce_confidence(raw_node.get("confidence")),
                     )
                 )
 
@@ -261,7 +262,8 @@ async def _extract_chapter_chunk_graph(
       "category": "核心概念",
       "chapter": "{chapter.title}",
       "page": {chapter.page_start or "null"},
-      "source_excerpt": "该知识点在原文中对应的一句或短语"
+      "source_excerpt": "该知识点在原文中对应的一句或短语",
+      "confidence": 0.92
     }}
   ],
   "edges": [
@@ -270,6 +272,60 @@ async def _extract_chapter_chunk_graph(
       "target": "node_002",
       "relation_type": "prerequisite",
       "description": "理解动作电位需要先掌握静息电位的概念"
+    }}
+  ]
+}}
+
+few-shot 示例：
+输入片段：
+"细胞在安静状态下存在静息电位。受到有效刺激后，膜电位可快速去极化并形成动作电位。动作电位的产生依赖 Na+ 通道开放，随后 K+ 外流参与复极。"
+
+输出示例：
+{{
+  "nodes": [
+    {{
+      "id": "node_001",
+      "name": "静息电位",
+      "definition": "细胞安静状态下膜两侧存在的电位差。",
+      "category": "核心概念",
+      "chapter": "{chapter.title}",
+      "page": {chapter.page_start or "null"},
+      "source_excerpt": "细胞在安静状态下存在静息电位",
+      "confidence": 0.95
+    }},
+    {{
+      "id": "node_002",
+      "name": "动作电位",
+      "definition": "有效刺激引起膜电位快速去极化形成的电位变化。",
+      "category": "核心概念",
+      "chapter": "{chapter.title}",
+      "page": {chapter.page_start or "null"},
+      "source_excerpt": "受到有效刺激后，膜电位可快速去极化并形成动作电位",
+      "confidence": 0.93
+    }},
+    {{
+      "id": "node_003",
+      "name": "Na+ 通道开放",
+      "definition": "动作电位产生过程中钠离子通道开放的现象。",
+      "category": "生理机制",
+      "chapter": "{chapter.title}",
+      "page": {chapter.page_start or "null"},
+      "source_excerpt": "动作电位的产生依赖 Na+ 通道开放",
+      "confidence": 0.9
+    }}
+  ],
+  "edges": [
+    {{
+      "source": "node_001",
+      "target": "node_002",
+      "relation_type": "prerequisite",
+      "description": "理解动作电位需要先掌握静息电位"
+    }},
+    {{
+      "source": "node_003",
+      "target": "node_002",
+      "relation_type": "applies_to",
+      "description": "Na+ 通道开放用于解释动作电位产生机制"
     }}
   ]
 }}
@@ -286,6 +342,7 @@ async def _extract_chapter_chunk_graph(
 - 边的 source/target 必须引用本次输出中的节点 id。
 - 定义要简洁，避免整段照抄原文。
 - source_excerpt 只能摘取一句关键原文或短语，用于用户点击节点时定位出处。
+- confidence 表示该节点来自原文证据的可信度，范围 0 到 1；证据明确时接近 1，推断较多时降低。
 
 章节标题：{chapter.title}
 章节片段：{chunk_index}/{chunk_count}
@@ -364,6 +421,14 @@ def _coerce_page(value: object) -> int | None:
     except (TypeError, ValueError):
         return None
     return page if page > 0 else None
+
+
+def _coerce_confidence(value: object) -> float:
+    try:
+        confidence = float(value)
+    except (TypeError, ValueError):
+        return 1.0
+    return max(0.0, min(confidence, 1.0))
 
 
 def _format_exception(exc: Exception) -> str:

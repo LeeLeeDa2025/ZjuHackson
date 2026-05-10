@@ -89,13 +89,30 @@
                 <p id="graphStats" class="muted-text graph-stats">选择构建范围后点击生成。</p>
               </div>
               <div class="graph-controls">
-                <input id="graphSearch" class="search-input" type="search" placeholder="搜索知识点" />
+            <input id="graphSearch" class="search-input" type="search" placeholder="搜索知识点" />
+                <select id="graphMergeModeSelect" class="select-input compact-select" title="切换融合前后视图">
+                  <option value="merged">融合视图</option>
+                  <option value="source">原始来源视图</option>
+                </select>
                 <button id="resetViewButton" class="icon-button" type="button" title="重置视图" aria-label="重置视图">↺</button>
                 <span id="graphStatus" class="status-pill muted">未生成</span>
               </div>
             </div>
             <div id="graphLegend" class="graph-legend"></div>
+            <div class="graph-viewbar">
+              <div class="segmented-control" aria-label="图谱视图切换">
+                <button class="segment-button active" type="button" data-graph-view="graph">关系图</button>
+                <button class="segment-button" type="button" data-graph-view="matrix">知识矩阵</button>
+              </div>
+              <div id="relationFilters" class="relation-filters" aria-label="关系类型筛选">
+                <label><input type="checkbox" value="prerequisite" data-relation-filter checked /> 前置依赖</label>
+                <label><input type="checkbox" value="parallel" data-relation-filter checked /> 并列关系</label>
+                <label><input type="checkbox" value="contains" data-relation-filter checked /> 包含关系</label>
+                <label><input type="checkbox" value="applies_to" data-relation-filter checked /> 应用关系</label>
+              </div>
+            </div>
             <svg id="graphSvg" class="graph-svg" role="img" aria-label="知识图谱"></svg>
+            <div id="graphMatrix" class="graph-matrix hidden" aria-label="知识矩阵"></div>
           </article>
 
           <aside class="panel graph-detail-panel">

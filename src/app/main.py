@@ -123,9 +123,9 @@ def list_textbooks() -> list[TextbookSummary]:
 
 
 @app.get("/api/knowledge-graph")
-def get_aggregate_knowledge_graph() -> dict:
+def get_aggregate_knowledge_graph(merged: bool = True) -> dict:
     graphs = storage.list_knowledge_graphs()
-    return _aggregate_knowledge_graphs(graphs)
+    return _aggregate_knowledge_graphs(graphs) if merged else _source_knowledge_graphs(graphs)
 
 
 @app.get("/api/textbooks/{textbook_id}", response_model=Textbook)
@@ -432,9 +432,11 @@ def _aggregate_knowledge_graphs(graphs: list[KnowledgeGraph]) -> dict:
                     "textbook_ids": [],
                     "textbook_titles": [],
                     "sources": [],
+                    "confidence": 0.0,
                 },
             )
             aggregate["frequency"] += 1
+            aggregate["confidence"] += node.confidence
             if len(node.definition) > len(aggregate.get("definition", "")):
                 aggregate["definition"] = node.definition
             if graph.textbook_id not in aggregate["textbook_ids"]:
@@ -449,6 +451,7 @@ def _aggregate_knowledge_graphs(graphs: list[KnowledgeGraph]) -> dict:
                     "page": node.page,
                     "definition": node.definition,
                     "source_excerpt": node.source_excerpt,
+                    "confidence": node.confidence,
                     "node_id": node.id,
                 }
             )
@@ -481,10 +484,80 @@ def _aggregate_knowledge_graphs(graphs: list[KnowledgeGraph]) -> dict:
                 aggregate["textbook_ids"].append(graph.textbook_id)
                 aggregate["textbook_titles"].append(graph.title)
 
+    nodes = list(node_by_key.values())
+    for node in nodes:
+        node["confidence"] = round(node["confidence"] / max(node["frequency"], 1), 3)
+
     return {
+        "merge_mode": "merged",
         "textbook_count": len(graphs),
-        "nodes": list(node_by_key.values()),
+        "raw_node_count": sum(len(graph.nodes) for graph in graphs),
+        "merged_node_count": len(nodes),
+        "nodes": nodes,
         "edges": list(edges_by_key.values()),
+    }
+
+
+def _source_knowledge_graphs(graphs: list[KnowledgeGraph]) -> dict:
+    nodes: list[dict] = []
+    edges: list[dict] = []
+    node_id_map: dict[tuple[str, str], str] = {}
+
+    for graph in graphs:
+        for node in graph.nodes:
+            aggregate_id = f"src_{graph.textbook_id}_{node.id}"
+            node_id_map[(graph.textbook_id, node.id)] = aggregate_id
+            nodes.append(
+                {
+                    "id": aggregate_id,
+                    "name": node.name,
+                    "definition": node.definition,
+                    "category": node.category,
+                    "frequency": 1,
+                    "textbook_count": 1,
+                    "textbook_ids": [graph.textbook_id],
+                    "textbook_titles": [graph.title],
+                    "confidence": node.confidence,
+                    "sources": [
+                        {
+                            "textbook_id": graph.textbook_id,
+                            "textbook_title": graph.title,
+                            "chapter": node.chapter,
+                            "page": node.page,
+                            "definition": node.definition,
+                            "source_excerpt": node.source_excerpt,
+                            "confidence": node.confidence,
+                            "node_id": node.id,
+                        }
+                    ],
+                }
+            )
+
+    for graph in graphs:
+        for edge in graph.edges:
+            source = node_id_map.get((graph.textbook_id, edge.source))
+            target = node_id_map.get((graph.textbook_id, edge.target))
+            if not source or not target:
+                continue
+            edges.append(
+                {
+                    "source": source,
+                    "target": target,
+                    "relation_type": edge.relation_type,
+                    "description": edge.description,
+                    "frequency": 1,
+                    "textbook_ids": [graph.textbook_id],
+                    "textbook_titles": [graph.title],
+                }
+            )
+
+    return {
+        "merge_mode": "source",
+        "textbook_count": len(graphs),
+        "raw_node_count": len(nodes),
+        "merged_node_count": len(nodes),
+        "nodes": nodes,
+        "edges": edges,
     }
 
 

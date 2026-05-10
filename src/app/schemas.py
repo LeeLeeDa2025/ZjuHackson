@@ -53,6 +53,7 @@ class KnowledgeNode(BaseModel):
     chapter: str
     page: int | None = None
     source_excerpt: str | None = None
+    confidence: float = Field(default=1.0, ge=0.0, le=1.0)
 
 
 class KnowledgeEdge(BaseModel):
@@ -86,6 +87,7 @@ class RagQueryRequest(BaseModel):
     question: str
     textbook_ids: list[str] | None = None
     top_k: int = Field(default=5, ge=1, le=20)
+    history: list[dict[str, str]] = Field(default_factory=list)
 
 
 class SourceCitation(BaseModel):
@@ -101,6 +103,8 @@ class SourceCitation(BaseModel):
     chunk_count: int = 1
     excerpt: str
     score: float
+    vector_score: float | None = None
+    keyword_score: float | None = None
 
 
 class RagQueryResponse(BaseModel):
