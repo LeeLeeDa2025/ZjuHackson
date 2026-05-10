@@ -45,7 +45,7 @@ http://localhost:8000
 
 ## 环境变量
 
-`.env` 不应提交到 GitHub。请从 `.env.example` 复制后填写：
+请从 `.env.example` 复制一份本地配置文件，并填写模型服务参数：
 
 ```env
 MODELSCOPE_API_KEY=your_modelscope_api_key_here
@@ -66,7 +66,7 @@ RAG_EMBEDDING_MODEL=BAAI/bge-small-zh-v1.5
 
 ## 在线部署
 
-仓库已提供 `Dockerfile`、`.dockerignore` 和 `render.yaml`，可直接部署到 Render、Railway、Fly.io 等支持 Docker 或 Python Web Service 的平台。
+仓库已提供 `Dockerfile` 和 `render.yaml`，可部署到 Render、Railway、Fly.io 等支持 Docker 或 Python Web Service 的平台。
 
 Render 部署步骤：
 
@@ -80,8 +80,6 @@ uvicorn src.app.main:app --host 0.0.0.0 --port $PORT
 
 4. 在平台环境变量中配置 `MODELSCOPE_API_KEY` 等参数。
 5. 部署完成后访问平台生成的公网 URL。
-
-说明：教材原文、解析缓存、向量索引和 `.env` 均被 `.gitignore` / `.dockerignore` 排除，不会上传到 GitHub 或构建镜像。
 
 ## 主要 API
 
@@ -149,5 +147,3 @@ docs/
 report/
   整合报告.md
 ```
-
-本地运行产生的 `data/`、教材 PDF、`.env`、缓存文件均不会提交。
